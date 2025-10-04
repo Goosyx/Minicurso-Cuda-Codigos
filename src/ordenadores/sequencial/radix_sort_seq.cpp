@@ -82,9 +82,9 @@ void exec_radix(const char **entradas, int num_entradas, const char *csv_saida)
         chrono::duration<double> elapsed = end - start;
         double cpu_time_used = elapsed.count();
 
-        printf("Radix Sort - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
+        printf("Radix Sort Sequencial - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
 
-        fprintf(csv, "RadixSort,%ld,%f\n", tamanho, cpu_time_used);
+        fprintf(csv, "RadixSort Sequencial,%ld,%f\n", tamanho, cpu_time_used);
 
         fseek(file, 0, SEEK_SET);
         if(fwrite(v, sizeof(int), tamanho, file) != tamanho)

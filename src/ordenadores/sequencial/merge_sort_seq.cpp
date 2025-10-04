@@ -93,9 +93,9 @@ void exec_merge(const char **entradas, int num_entradas, const char *csv_saida)
         chrono::duration<double> elapsed = end - start;
         double cpu_time_used = elapsed.count();
 
-        printf("Merge Sort - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
+        printf("Merge Sort Sequencial - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
 
-        fprintf(csv, "MergeSort,%ld,%f\n", tamanho, cpu_time_used);
+        fprintf(csv, "MergeSort Sequencial,%ld,%f\n", tamanho, cpu_time_used);
 
         fseek(file, 0, SEEK_SET);
         if(fwrite(v, sizeof(int), tamanho, file) != tamanho)
@@ -154,7 +154,7 @@ void imprimir_vetor(const char **entrada, int num_entradas)
 
 int main()
 {
-    int num_entradas = 11;
+    int num_entradas = 1;
 
     const char *entradas[num_entradas] =
     {
