@@ -1,5 +1,12 @@
 .PHONY: dados clean
 
+main:
+	mkdir -p dados
+	mkdir -p results
+	g++ -std=c++17 -O2 -o main src/main.cpp
+	./main
+	rm main
+
 dados:
 	mkdir -p dados
 	g++ -std=c++17 -O2 -o gerador_dados src/gerador_dados.cpp

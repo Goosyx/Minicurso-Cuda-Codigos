@@ -3,10 +3,19 @@
 #include <stdlib.h>
 #include <time.h>
 #include <chrono>
+#include <pthread.h>
+
 
 using namespace std;
 
-void merge(int *v, int p, int q, int r){
+struct ThreadDados {
+    int *vetor;
+    int esquerda;
+    int direita;
+    int num_threads;
+};
+
+void MergeThread(int *v, int p, int q, int r){
     int n1 = q - p + 1;
     int n2 = r - q;
 
@@ -46,17 +55,58 @@ void merge(int *v, int p, int q, int r){
     delete[] dir;
 }
 
-void MergeSort(int *v, int p, int r)
+int count = 0;
+int count2 = 0;
+void* MergeSortThreadWrapper(void *arg);
+
+void MergeSort(int *vetor, int esquerda, int direita, int num_threads)
 {
-    if(p < r){
-        int m = (p+r)/2;
-        MergeSort(v, p, m);
-        MergeSort(v, m+1, r);
-        merge(v, p, m, r);
+
+    if (esquerda < direita)
+    {
+
+        int meio = (esquerda + direita) / 2;
+
+        if (num_threads > 1)
+        {
+
+
+            pthread_t thread_esq;
+            pthread_t thread_dir;
+
+            ThreadDados *dados_esq = new ThreadDados{vetor, esquerda, meio, num_threads / 2};
+            ThreadDados *dados_dir = new ThreadDados{vetor, meio + 1, direita, num_threads / 2};
+
+            pthread_create(&thread_esq, NULL, MergeSortThreadWrapper, dados_esq);
+            pthread_create(&thread_dir, NULL, MergeSortThreadWrapper, dados_dir);
+
+            pthread_join(thread_esq, NULL);
+            pthread_join(thread_dir, NULL);
+
+
+        }
+        else
+        {
+            count2++;
+            MergeSort(vetor, esquerda, meio, 1);
+            MergeSort(vetor, meio + 1, direita, 1);
+        }
+        MergeThread(vetor, esquerda, meio, direita);
+
     }
+
 }
 
-void exec_merge(const char **entradas, int num_entradas, const char *csv_saida)
+void* MergeSortThreadWrapper(void *arg)
+{   count++;
+
+    ThreadDados *dados = (ThreadDados *)arg;
+    MergeSort(dados->vetor, dados->esquerda, dados->direita, dados->num_threads);
+    delete dados;
+    pthread_exit(0);
+}
+
+void ExecMergeThread(const char **entradas, int num_entradas, int num_threads, const char *csv_saida)
 {
     FILE *csv = fopen(csv_saida, "a");
     if (!csv)
@@ -88,14 +138,14 @@ void exec_merge(const char **entradas, int num_entradas, const char *csv_saida)
         }
 
         auto start = chrono::high_resolution_clock::now();
-        MergeSort(v, 0, tamanho - 1);
+        MergeSort(v, 0, tamanho - 1, num_threads);
         auto end = chrono::high_resolution_clock::now();
         chrono::duration<double> elapsed = end - start;
         double cpu_time_used = elapsed.count();
 
-        printf("Merge Sort Sequencial - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
+        printf("MergeSort Threads - Tempo para ordenar %s: %f segundos\n", entradas[i], cpu_time_used);
 
-        fprintf(csv, "MergeSort Sequencial,%ld,%f\n", tamanho, cpu_time_used);
+        fprintf(csv, "MergeSort - Threads,%ld,%f\n", tamanho, cpu_time_used);
 
         fseek(file, 0, SEEK_SET);
         if(fwrite(v, sizeof(int), tamanho, file) != tamanho)
@@ -111,68 +161,7 @@ void exec_merge(const char **entradas, int num_entradas, const char *csv_saida)
     }
 
     fclose(csv);
-}
 
-void imprimir_vetor(const char **entrada, int num_entradas)
-{
-    for(int i = 0; i < num_entradas; i++)
-    {
-        FILE *file = fopen(entrada[i], "rb");
-        if(!file)
-        {
-            perror(entrada[i]);
-            continue;
-        }
-
-        fseek(file, 0, SEEK_END);
-        long tamanho = ftell(file) / sizeof(int);
-        fseek(file, 0, SEEK_SET);
-
-        int *v = new int[tamanho];
-        if(fread(v, sizeof(int), tamanho, file) != tamanho)
-        {
-            perror("Erro ao ler o arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
-        fclose(file);
-
-
-        printf("Vetor %s:\n", entrada[i]);
-    
-        for(long j = 0; j < tamanho; j++)
-        {
-            printf("%d ", v[j]);
-        }
-
-        printf("\n\n");
-
-        delete[] v;
-    }
-}
-
-int main()
-{
-    int num_entradas = 1;
-
-    const char *entradas[num_entradas] =
-    {
-        "dados/250k.bin", "dados/500k.bin", "dados/750k.bin", "dados/1m.bin",
-        "dados/2m500.bin", "dados/5m.bin", "dados/7m500.bin", "dados/10m.bin",
-        "dados/25m.bin", "dados/50m.bin", "dados/100m.bin"
-
-    };
-
-
-
-    FILE *csv = fopen("results/tempos.csv", "w");
-    if (csv) {
-        fprintf(csv, "Algoritmo,Tamanho,Tempo\n");
-        fclose(csv);
-    }
-
-    exec_merge(entradas, num_entradas, "results/tempos.csv");
-    //imprimir_vetor(entradas, 11);
-
+    printf("Threads: %d\n", count);
+    printf("SEQUENCIAL: %d\n", count2);
 }
