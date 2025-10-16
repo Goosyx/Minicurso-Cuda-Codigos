@@ -19,5 +19,5 @@ plt.legend()
 plt.grid(True, which="both", linestyle="--", alpha=0.6)
 
 plt.tight_layout()
-plt.savefig("results/grafico_comparacao1.png", dpi=300)
+plt.savefig("results/grafico_comparacao.png", dpi=300)
 plt.show()
