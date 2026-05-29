@@ -31,51 +31,59 @@ using namespace std;
  *
  * Parâmetros:
  * - vetor: ponteiro para o array de inteiros a ser ordenado
+ * - buffer: ponteiro para buffer auxiliar pré-alocado (tamanho >= n pelo chamador)
  * - começo: índice inicial do primeiro subvetor
- * - meio: índice final do primeiro subvetor
- * - fim: índice final do segundo subvetor
+ * - meio: índice final do primeiro subvetor (inclusivo)
+ * - fim: índice final do segundo subvetor (inclusivo)
  *
  * Funcionamento:
- * - Cria vetores auxiliares para os segmentos esquerdo e direito
- * - Copia os elementos dos subvetores para os auxiliares
- * - Mescla os dois subvetores de volta ao vetor principal, mantendo a ordem
- * - Garante estabilidade na ordenação
+ * - Utiliza o buffer auxiliar pré-alocado pelo chamador (MergeSortSeq) para
+ *   realizar o merge sem alocações dinâmicas por chamada.
+ * - Copia os elementos do intervalo [começo, fim] para o buffer, faz o merge
+ *   e escreve o resultado de volta no vetor original.
+ * - Garante estabilidade na ordenação.
+ *
+ * ATENÇÃO — motivação desta assinatura:
+ *   A versão anterior alocava `new int[]` e `delete[]` a cada chamada de MergeSeq.
+ *   Para N=100M elementos, isso representa milhões de alocações de heap durante o sort,
+ *   penalizando o modo sequencial artificialmente em relação ao CUDA (que usa um único
+ *   buffer pré-alocado em GPU) e ao modo threads. O buffer é agora alocado uma única
+ *   vez em MergeSortSeq e reutilizado em todas as chamadas, tornando a comparação justa.
  */
-void MergeSeq(int *vetor, int começo, int meio, int fim)
+void MergeSeq(int *vetor, int *buffer, int começo, int meio, int fim)
 {
     int tam_esquerda = meio - começo + 1;
     int tam_direita = fim - meio;
 
-    int *vet_esq = new int[tam_esquerda];
-    int *vet_dir = new int[tam_direita];
-
-    // Copia elementos para os vetores auxiliares
+    // Copia os dois subvetores para o buffer auxiliar pré-alocado.
+    // buffer[0..tam_esquerda-1]              ← metade esquerda
+    // buffer[tam_esquerda..tam_esquerda+tam_direita-1] ← metade direita
     int idx_esq = 0;
     while(idx_esq < tam_esquerda)
     {
-        vet_esq[idx_esq] = vetor[começo + idx_esq];
+        buffer[idx_esq] = vetor[começo + idx_esq];
         idx_esq++;
     }
     
     int idx_dir = 0;
     while(idx_dir < tam_direita)
     {
-        vet_dir[idx_dir] = vetor[meio + 1 + idx_dir];
+        buffer[tam_esquerda + idx_dir] = vetor[meio + 1 + idx_dir];
         idx_dir++;
     }
 
-    // Mescla os vetores auxiliares de volta ao vetor principal
+    // Mescla as duas metades do buffer de volta ao vetor principal
     idx_esq = 0;
     idx_dir = 0;
     int idx = começo;
     while(idx_esq < tam_esquerda && idx_dir < tam_direita)
     {
-        if(vet_esq[idx_esq] <= vet_dir[idx_dir])
+        if(buffer[idx_esq] <= buffer[tam_esquerda + idx_dir])
         {
-            vetor[idx] = vet_esq[idx_esq];
+            vetor[idx] = buffer[idx_esq];
             idx_esq++;
         } else {
-            vetor[idx] = vet_dir[idx_dir];
+            vetor[idx] = buffer[tam_esquerda + idx_dir];
             idx_dir++;
         }
         idx++;
@@ -84,20 +92,17 @@ void MergeSeq(int *vetor, int começo, int meio, int fim)
     // Copia o restante dos elementos, se houver
     while(idx_esq < tam_esquerda)
     {
-        vetor[idx] = vet_esq[idx_esq];
+        vetor[idx] = buffer[idx_esq];
         idx_esq++;
         idx++;
     }
 
     while(idx_dir < tam_direita)
     {
-        vetor[idx] = vet_dir[idx_dir];
+        vetor[idx] = buffer[tam_esquerda + idx_dir];
         idx_dir++;
         idx++;
     }
-
-    delete[] vet_esq;
-    delete[] vet_dir;
 }
 
 // ============================================================
@@ -111,12 +116,21 @@ void MergeSeq(int *vetor, int começo, int meio, int fim)
  * - n: número de elementos no array
  *
  * Funcionamento:
- * - Começa com subvetores de tamanho 1 e vai dobrando o tamanho a cada iteração
- * - Para cada par de subvetores adjacentes, chama MergeSeq para mesclar
- * - Repete até que todo o vetor esteja ordenado
+ * - Aloca um único buffer auxiliar de tamanho n antes do loop principal.
+ *   Este buffer é reutilizado em todas as chamadas a MergeSeq, eliminando
+ *   milhões de alocações de heap que ocorriam na versão anterior (onde cada
+ *   chamada a MergeSeq fazia new/delete internamente).
+ * - Começa com subvetores de tamanho 1 e vai dobrando o tamanho a cada iteração.
+ * - Para cada par de subvetores adjacentes, chama MergeSeq para mesclar.
+ * - Repete até que todo o vetor esteja ordenado.
  */
 void MergeSortSeq(int *vetor, int n)
 {
+    // Buffer auxiliar pré-alocado: reutilizado em todas as chamadas a MergeSeq.
+    // Tamanho n é suficiente pois o maior merge possível envolve o vetor inteiro.
+    // Analogia direta com o buffer_device do CUDA, que também é alocado uma única vez.
+    int *buffer = new int[n];
+
     int tamanho = 1;
     while(tamanho < n)
     {
@@ -128,13 +142,15 @@ void MergeSortSeq(int *vetor, int n)
             int fim = min(inicio + 2 * tamanho - 1, n - 1);
             
             if(meio < fim)
-                MergeSeq(vetor, começo, meio, fim);
+                MergeSeq(vetor, buffer, começo, meio, fim);
             
             inicio += 2 * tamanho;
         }
         
         tamanho *= 2;
     }
+
+    delete[] buffer;
 }
 
 // ============================================================
@@ -161,57 +177,27 @@ void MergeSortSeq(int *vetor, int n)
  */
 void ExecMergeSeq(const char **entradas, int num_entradas, const char *csv_saida)
 {
-    FILE *csv = fopen(csv_saida, "a");
-    if (!csv)
-    {
-        perror("Erro ao abrir arquivo CSV");
-        return;
-    }
+    FILE *csv = AbrirCSV(csv_saida);
+    if (!csv) return;
 
     for (int i = 0; i < num_entradas; i++)
     {
-        FILE *file = fopen(entradas[i], "rb+"); // abre para leitura/escrita binária
+        long tamanho;
+        int *vetor;
+        FILE *file = LerVetor(entradas[i], &vetor, &tamanho);
+        if (!file) continue;
 
-        if(!file)
-        {
-            perror(entradas[i]);
-            return;
-        }
-
-        fseek(file, 0, SEEK_END);
-        long tamanho = ftell(file) / sizeof(int);
-        fseek(file, 0, SEEK_SET);
-
-        int *vetor = new int[tamanho];
-
-        if(fread(vetor, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao ler o arquivo");
-            fclose(file);
-            delete[] vetor;
-            continue;
-        }
-
-        auto start = chrono::high_resolution_clock::now();
+        auto inicio = chrono::high_resolution_clock::now();
         MergeSortSeq(vetor, tamanho);
-        auto end = chrono::high_resolution_clock::now();
+        auto fim = chrono::high_resolution_clock::now();
 
-        chrono::duration<double> elapsed = end - start;
-        double tempo = elapsed.count();
+        chrono::duration<double> decorrido = fim - inicio;
+        double tempo = decorrido.count();
 
         printf("Merge Sort Sequencial - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
         fprintf(csv, "MergeSort - Sequencial,%ld,%f\n", tamanho, tempo);
 
-        fseek(file, 0, SEEK_SET);
-        if(fwrite(vetor, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao escrever no arquivo");
-            fclose(file);
-            delete[] vetor;
-            continue;
-        }    
-
-        fclose(file);
+        GravarEFechar(file, vetor, tamanho);
         delete[] vetor;
     }
 

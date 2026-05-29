@@ -88,7 +88,58 @@ void VerificarOrdenado(const char **arquivos, const int num_entradas)
     }
 }
 
-void GerarArquivos(const long *tamanho_arquivos, const char **nomes_arquivos, const int num_arquivos) 
+// ============================================================
+//              FUNÇÕES AUXILIARES DE I/O
+// ============================================================
+
+FILE* AbrirCSV(const char *path)
+{
+    FILE *csv = fopen(path, "a");
+    if (!csv) { perror("Erro ao abrir arquivo CSV"); }
+    return csv;
+}
+
+// Abre o arquivo binário, determina o tamanho, aloca com new e lê os dados.
+// Retorna o FILE* ainda aberto (para reescrever depois) e preenche *vetor e *n.
+// Em caso de erro, fecha o arquivo, libera memória e retorna NULL.
+FILE* LerVetor(const char *path, int **vetor, long *n)
+{
+    FILE *file = fopen(path, "rb+");
+    if (!file) { perror(path); return NULL; }
+
+    fseek(file, 0, SEEK_END);
+    *n = ftell(file) / sizeof(int);
+    fseek(file, 0, SEEK_SET);
+
+    *vetor = new int[*n];
+    if (fread(*vetor, sizeof(int), *n, file) != (size_t)*n)
+    {
+        perror("Erro ao ler o arquivo");
+        fclose(file);
+        delete[] *vetor;
+        *vetor = NULL;
+        return NULL;
+    }
+
+    return file;
+}
+
+// Reescreve o vetor no início do arquivo e fecha.
+// Retorna true em sucesso, false em erro (arquivo já fechado em ambos os casos).
+bool GravarEFechar(FILE *file, int *vetor, long n)
+{
+    fseek(file, 0, SEEK_SET);
+    if (fwrite(vetor, sizeof(int), n, file) != (size_t)n)
+    {
+        perror("Erro ao escrever no arquivo");
+        fclose(file);
+        return false;
+    }
+    fclose(file);
+    return true;
+}
+
+void GerarArquivos(const long *tamanho_arquivos, const char **nomes_arquivos, const int num_arquivos)
 {
     for (int i = 0; i < num_arquivos; i++) 
     {

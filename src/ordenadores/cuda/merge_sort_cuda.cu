@@ -5,10 +5,10 @@
 #include <chrono>
 #include <cuda_runtime.h>
 
-#define THREADS_POR_BLOCO 256
+#define MERGE_THREADS_POR_BLOCO 1
 
 /*
-    * THREADS_POR_BLOCO: número de threads por bloco CUDA quando lançamos um kernel.
+    * MERGE_THREADS_POR_BLOCO: número de threads por bloco CUDA quando lançamos um kernel.
         - É uma configuração de desempenho que normalmente depende da GPU.
         - não necessariamente mais threads significa mais desempenho.
 */ 
@@ -55,9 +55,10 @@ __global__ void MergeKernel(int* dados, int* buffer_temp, int N, int tamanho_atu
     long thread_id = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Calcula os índices (em elementos) das duas metades a serem mescladas:
-    long esquerda  = (long)thread_id * tamanho_atual * 2L;      // esquerda  = início da primeira metade
-    long meio   = esquerda + tamanho_atual;                     // meio   = início da segunda metade
-    long direita = (long)(thread_id + 1) * tamanho_atual * 2L;  // direita = fim (exclusivo) da segunda metade
+    // Cast explícito para long antes de qualquer multiplicação para evitar overflow de int
+    long esquerda  = (long)thread_id * (long)tamanho_atual * 2L;       // esquerda  = início da primeira metade
+    long meio      = esquerda + (long)tamanho_atual;                    // meio      = início da segunda metade
+    long direita   = (long)(thread_id + 1L) * (long)tamanho_atual * 2L; // direita   = fim (exclusivo) da segunda metade
 
     // Verificações de segurança para evitar acessar além do array.
     if (esquerda >= N) return;        // nada a fazer se o início estiver fora
@@ -148,44 +149,40 @@ void MergeSortCuda(int* dados, int* buffer_temp, int N)
         long total_threads = (N + (tamanho * 2L - 1L)) / (tamanho * 2L);
 
         // Converte número de threads em número de blocos considerando
-        // THREADS_POR_BLOCO por bloco.
-        int blocos = (int)((total_threads + THREADS_POR_BLOCO - 1) / THREADS_POR_BLOCO);
+        // MERGE_THREADS_POR_BLOCO por bloco.
+        int blocos = (int)((total_threads + MERGE_THREADS_POR_BLOCO - 1) / MERGE_THREADS_POR_BLOCO);
 
-        // Lança o kernel com a configuração (blocos, THREADS_POR_BLOCO).
-        MergeKernel<<<blocos, THREADS_POR_BLOCO>>>(dados, buffer_temp, N, tamanho);
+        // Lança o kernel com a configuração (blocos, MERGE_THREADS_POR_BLOCO).
+        MergeKernel<<<blocos, MERGE_THREADS_POR_BLOCO>>>(dados, buffer_temp, N, tamanho);
 
-        // Sincroniza e verifica erros de execução. cudaDeviceSynchronize
-        // bloqueia até que o kernel termine — importante para checar erros
-        // e para garantir que a próxima iteração trabalhe com dados consistentes.
+        // Verifica erro de configuração/launch imediatamente após o lançamento.
+        // cudaGetLastError() captura erros síncronos (ex: parâmetros inválidos,
+        // recursos insuficientes) que ocorrem antes da execução do kernel na GPU.
+        cudaError_t launchErr = cudaGetLastError();
+        if (launchErr != cudaSuccess)
+        {
+            fprintf(stderr, "Erro de launch na iteração tamanho=%d: %s\n", tamanho, cudaGetErrorString(launchErr));
+            return;
+        }
+
+        // cudaDeviceSynchronize bloqueia a CPU até o kernel terminar na GPU.
+        // Qualquer erro de execução do kernel (ex: acesso fora dos limites) é
+        // reportado aqui, pois a execução do kernel é assíncrona em relação à CPU.
         cudaError_t syncErr = cudaDeviceSynchronize();
         if (syncErr != cudaSuccess) 
         {
-            fprintf(stderr, "Erro após cudaDeviceSynchronize() na iteração tamanho=%d: %s\n", tamanho, cudaGetErrorString(syncErr));
-            cudaError_t launchErr = cudaGetLastError();
-            if (launchErr != cudaSuccess)
-            {
-                fprintf(stderr, "Erro de launch: %s\n", cudaGetErrorString(launchErr));
-            }
-
-            return; // Em caso de erro, aborta a ordenação
-        }
-
-        // Checa erros residuais do lançamento do kernel
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) 
-        {
-            fprintf(stderr, "Erro no kernel após tamanho=%d: %s\n", tamanho, cudaGetErrorString(err));
+            fprintf(stderr, "Erro de execução do kernel na iteração tamanho=%d: %s\n", tamanho, cudaGetErrorString(syncErr));
             return;
         }
     }
 }
 
 // ============================================================
-//    FUNÇÃO HostParaDevice() - GERENCIA COPIAS HOST/DEVICE
+//    FUNÇÃO HostParaDeviceMerge() - GERENCIA COPIAS HOST/DEVICE
 // ============================================================
 
 /*
- * HostParaDevice: interface que recebe os dados no host (CPU), aloca memória na GPU,
+ * HostParaDeviceMerge: interface que recebe os dados no host (CPU), aloca memória na GPU,
  * copia os dados para lá, executa MergeSortCuda na GPU e copia o resultado
  * de volta para o host.
  *
@@ -193,7 +190,7 @@ void MergeSortCuda(int* dados, int* buffer_temp, int N)
  * - dados_host: ponteiro para array de inteiros na memória do host
  * - N: número de elementos no array
  */
-void HostParaDevice(int* dados_host, int N)
+void HostParaDeviceMerge(int* dados_host, int N)
 {
     int *dados_device = nullptr;
     int *buffer_device = nullptr; // ponteiros para device (GPU)
@@ -262,60 +259,49 @@ void HostParaDevice(int* dados_host, int N)
  */
 void ExecMergeCuda(const char **entradas, int num_entradas, const char *csv_saida)
 {
-    FILE *csv = fopen(csv_saida, "a");
-    if (!csv) 
-    {
-        perror("Erro ao abrir arquivo CSV");
-        return;
-    }
+    FILE *csv = AbrirCSV(csv_saida);
+    if (!csv) return;
 
-    for (int i = 0; i < num_entradas; i++) 
-    {
-        FILE *file = fopen(entradas[i], "rb+"); // abre para leitura/escrita binária
-        if (!file) 
-        {
-            perror(entradas[i]);
-            return;
-        }
+    cudaError_t err;
 
-        // Determina quantos inteiros existem no arquivo
+    for (int i = 0; i < num_entradas; i++)
+    {
+        FILE *file = fopen(entradas[i], "rb+");
+        if (!file) { perror(entradas[i]); continue; }
+
         fseek(file, 0, SEEK_END);
         long tamanho = ftell(file) / sizeof(int);
         fseek(file, 0, SEEK_SET);
 
-        int *v = new int[tamanho]; // aloca vetor no heap para os dados
-        if (fread(v, sizeof(int), tamanho, file) != (size_t)tamanho) 
+        int *v = nullptr;
+        err = cudaMallocHost(&v, tamanho * sizeof(int));
+        if (err != cudaSuccess)
         {
-            perror("Erro ao ler o arquivo");
+            fprintf(stderr, "Erro ao alocar pinned memory no host (N=%ld): %s\n", tamanho, cudaGetErrorString(err));
             fclose(file);
-            delete[] v;
             continue;
         }
 
-        // Mede o tempo de ordenação usando chrono (CPU side timer)
-        auto start = chrono::high_resolution_clock::now();
-        HostParaDevice(v, tamanho); // ordena chamando a GPU
-        auto end = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = end - start;
-        double tempo = elapsed.count();
+        if (fread(v, sizeof(int), tamanho, file) != (size_t)tamanho)
+        {
+            perror("Erro ao ler o arquivo");
+            fclose(file);
+            cudaFreeHost(v);
+            continue;
+        }
+
+        auto inicio = chrono::high_resolution_clock::now();
+        HostParaDeviceMerge(v, tamanho);
+        auto fim = chrono::high_resolution_clock::now();
+        chrono::duration<double> decorrido = fim - inicio;
+        double tempo = decorrido.count();
 
         printf("MergeSort CUDA - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
         fprintf(csv, "MergeSort - CUDA,%ld,%f\n", tamanho, tempo);
 
-        // Regrava o arquivo com os valores ordenados (volta ao início com fseek)
-        fseek(file, 0, SEEK_SET);
-        if(fwrite(v, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao escrever no arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
-
-        fclose(file);
-        delete[] v; // libera o vetor do host
+        GravarEFechar(file, v, tamanho);
+        cudaFreeHost(v);
     }
 
     fclose(csv);
 }
-

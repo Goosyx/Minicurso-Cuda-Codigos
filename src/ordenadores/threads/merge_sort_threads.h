@@ -10,43 +10,61 @@ using namespace std;
 // Estrutura para passar dados para cada thread
 struct ThreadDados {
     int *vetor;
+    int *buffer;           // Buffer auxiliar pré-alocado exclusivo desta thread
     int inicio_merge;      // Índice do primeiro merge que esta thread deve fazer
     int fim_merge;         // Índice do último merge que esta thread deve fazer
     int tamanho_sublista;  // Tamanho atual das sublistas a serem mescladas
     int n;                 // Tamanho total do vetor
 };
 
-// Função de merge (padronizada com while, similar ao CUDA)
-void MergeThread(int *v, int p, int q, int r){
+/*
+ * MergeThread: mescla dois subvetores adjacentes já ordenados em um único segmento ordenado.
+ *
+ * Parâmetros:
+ * - v: ponteiro para o array de inteiros a ser ordenado
+ * - buffer: ponteiro para buffer auxiliar pré-alocado exclusivo desta thread
+ * - p: índice inicial do primeiro subvetor
+ * - q: índice final do primeiro subvetor (inclusivo)
+ * - r: índice final do segundo subvetor (inclusivo)
+ *
+ * ATENÇÃO — motivação do parâmetro buffer:
+ *   A versão anterior alocava `new int[]` e `delete[]` a cada chamada de MergeThread.
+ *   Com múltiplas threads executando simultaneamente, o allocator de heap do C++ usa
+ *   locks internos, criando contenção entre threads e serializando as alocações —
+ *   o oposto do que se espera de código paralelo. O buffer agora é alocado uma única
+ *   vez por thread em MergeSortThread e reutilizado em todas as iterações,
+ *   eliminando essa contenção e tornando a comparação com os outros modos mais justa.
+ */
+void MergeThread(int *v, int *buffer, int p, int q, int r){
     int n1 = q - p + 1;
     int n2 = r - q;
 
-    int *esq = new int[n1];
-    int *dir = new int[n2];
-
-    // Copia elementos para arrays temporários usando while
+    // Copia os dois subvetores para o buffer auxiliar pré-alocado.
+    // buffer[0..n1-1]      ← metade esquerda
+    // buffer[n1..n1+n2-1]  ← metade direita
     int i = 0;
     while(i < n1){
-        esq[i] = v[p + i];
+        buffer[i] = v[p + i];
         i++;
     }
     
     int j = 0;
     while(j < n2){
-        dir[j] = v[q + 1 + j];
+        buffer[n1 + j] = v[q + 1 + j];
         j++;
     }
 
-    // Merge principal
+    // Merge principal: compara elementos das duas metades no buffer
+    // e escreve o resultado ordenado de volta em v
     i = 0;
     j = 0;
     int k = p;
     while(i < n1 && j < n2){
-        if(esq[i] <= dir[j]){
-            v[k] = esq[i];
+        if(buffer[i] <= buffer[n1 + j]){
+            v[k] = buffer[i];
             i++;
         } else {
-            v[k] = dir[j];
+            v[k] = buffer[n1 + j];
             j++;
         }
         k++;
@@ -54,20 +72,17 @@ void MergeThread(int *v, int p, int q, int r){
 
     // Copia elementos restantes da esquerda
     while(i < n1){
-        v[k] = esq[i];
+        v[k] = buffer[i];
         i++;
         k++;
     }
 
     // Copia elementos restantes da direita
     while(j < n2){
-        v[k] = dir[j];
+        v[k] = buffer[n1 + j];
         j++;
         k++;
     }
-
-    delete[] esq;
-    delete[] dir;
 }
 
 // Função que cada thread executa
@@ -75,11 +90,12 @@ void* ThreadMergeWorker(void *arg)
 {
     ThreadDados *dados = (ThreadDados *)arg;
     
-    // Cada thread processa uma faixa de merges
+    // Cada thread processa uma faixa de merges usando seu buffer exclusivo.
+    // O buffer foi alocado pelo chamador (MergeSortThread) com tamanho n,
+    // garantindo espaço suficiente para qualquer merge desta thread.
     int idx_merge = dados->inicio_merge;
     while(idx_merge < dados->fim_merge)
     {
-        // Calcula os índices p, q, r para este merge específico
         int inicio = idx_merge * dados->tamanho_sublista * 2;
         
         if(inicio >= dados->n - 1)
@@ -91,10 +107,9 @@ void* ThreadMergeWorker(void *arg)
         int q = min(inicio + dados->tamanho_sublista - 1, dados->n - 1);
         int r = min(inicio + 2 * dados->tamanho_sublista - 1, dados->n - 1);
         
-        // Só faz merge se houver dois sub-arrays
         if(q < r)
         {
-            MergeThread(dados->vetor, p, q, r);
+            MergeThread(dados->vetor, dados->buffer, p, q, r);
         }
         
         idx_merge++;
@@ -104,34 +119,50 @@ void* ThreadMergeWorker(void *arg)
     pthread_exit(0);
 }
 
-// MergeSort Bottom-Up com Threads (similar ao CUDA mas com threads POSIX)
+// MergeSort Bottom-Up com Threads 
 void MergeSortThread(int *vetor, int n, int num_threads)
 {
     if(n <= 1)
+    {
         return;
+    }
     
+    // Pré-aloca um buffer exclusivo por thread, cada um de tamanho n.
+    // Tamanho n é suficiente pois o maior merge possível envolve o vetor inteiro.
+    // Cada thread usa seu próprio buffer sem compartilhamento, evitando contenção.
+    // Os buffers são alocados uma única vez aqui e reutilizados em todas as
+    // iterações do loop externo, eliminando as alocações por merge da versão anterior.
+    //
+    // ATENÇÃO — por que um buffer por thread e não um único buffer compartilhado:
+    //   Threads executam merges simultaneamente em regiões distintas do vetor.
+    //   Um buffer único compartilhado exigiria sincronização ou particionamento
+    //   explícito, aumentando a complexidade. Um buffer por thread é a solução
+    //   mais simples e elimina qualquer risco de condição de corrida no buffer.
+    int **buffers = new int*[num_threads];
+    int t = 0;
+    while(t < num_threads)
+    {
+        buffers[t] = new int[n];
+        t++;
+    }
+
     // Loop externo: tamanho das sublistas (1, 2, 4, 8, ...)
     int tamanho = 1;
     while(tamanho < n)
     {
-        // Calcula quantos merges precisam ser feitos nesta iteração
         int total_merges = (n + (tamanho * 2 - 1)) / (tamanho * 2);
-        
-        // Limita o número de threads ao número de merges disponíveis
         int threads_usadas = min(num_threads, total_merges);
         
-        // Distribui os merges entre as threads
         pthread_t *threads = new pthread_t[threads_usadas];
         
-        int t = 0;
+        t = 0;
         while(t < threads_usadas)
         {
             ThreadDados *dados = new ThreadDados;
             dados->vetor = vetor;
+            dados->buffer = buffers[t]; // buffer exclusivo desta thread
             dados->tamanho_sublista = tamanho;
             dados->n = n;
-            
-            // Divide os merges igualmente entre as threads
             dados->inicio_merge = (total_merges * t) / threads_usadas;
             dados->fim_merge = (total_merges * (t + 1)) / threads_usadas;
             
@@ -139,7 +170,6 @@ void MergeSortThread(int *vetor, int n, int num_threads)
             t++;
         }
         
-        // Aguarda todas as threads terminarem antes de passar para o próximo tamanho
         t = 0;
         while(t < threads_usadas)
         {
@@ -150,59 +180,39 @@ void MergeSortThread(int *vetor, int n, int num_threads)
         delete[] threads;
         tamanho *= 2;
     }
+
+    // Libera todos os buffers após o sort completo
+    t = 0;
+    while(t < num_threads)
+    {
+        delete[] buffers[t];
+        t++;
+    }
+    delete[] buffers;
 }
 
 void ExecMergeThread(const char **entradas, int num_entradas, int num_threads, const char *csv_saida)
 {
-    FILE *csv = fopen(csv_saida, "a");
-    if (!csv)
+    FILE *csv = AbrirCSV(csv_saida);
+    if (!csv) return;
+
+    for (int i = 0; i < num_entradas; i++)
     {
-        perror("Erro ao abrir arquivo CSV");
-        return;
-    }
+        long tamanho;
+        int *v;
+        FILE *file = LerVetor(entradas[i], &v, &tamanho);
+        if (!file) continue;
 
-    for(int i = 0; i < num_entradas; i++)
-    {
-        FILE *file = fopen(entradas[i], "rb+");
-        if(!file)
-        {
-            perror(entradas[i]);
-            return;
-        }
-
-        fseek(file, 0, SEEK_END);
-        long tamanho = ftell(file) / sizeof(int);
-        fseek(file, 0, SEEK_SET);
-
-        int *v = new int[tamanho];
-        if(fread(v, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao ler o arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
-
-        auto start = chrono::high_resolution_clock::now();
+        auto inicio = chrono::high_resolution_clock::now();
         MergeSortThread(v, tamanho, num_threads);
-        auto end = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = end - start;
-        double tempo = elapsed.count();
+        auto fim = chrono::high_resolution_clock::now();
+        chrono::duration<double> decorrido = fim - inicio;
+        double tempo = decorrido.count();
 
         printf("MergeSort Threads - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
-
         fprintf(csv, "MergeSort - Threads,%ld,%f\n", tamanho, tempo);
 
-        fseek(file, 0, SEEK_SET);
-        if(fwrite(v, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao escrever no arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
-
-        fclose(file);
+        GravarEFechar(file, v, tamanho);
         delete[] v;
     }
 

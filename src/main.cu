@@ -2,8 +2,10 @@
 //                  Observações gerais
 // ============================================================
 /*
-    Este é o arquivo principal do projeto, responsável por orquestrar a execução dos algoritmos de ordenação
-    (Merge Sort e Radix Sort) em diferentes versões: sequencial, com threads e com CUDA (GPU).
+    Este é o arquivo principal do projeto, responsável por orquestrar a execução
+    dos algoritmos de ordenação (Merge Sort e Radix Sort) em diferentes versões:
+    sequencial, com threads POSIX e com CUDA (GPU).
+
     O fluxo geral é:
         1. Define os arquivos de entrada e seus tamanhos
         2. Gera os arquivos binários com dados aleatórios
@@ -24,16 +26,27 @@
 #include "ordenadores/threads/radix_sort_threads.h"
 #include "ordenadores/cuda/radix_sort_cuda.cu"
 
-
 // ============================================================
 //                  Função principal
 // ============================================================
 int main()
 {
-    // Define o número de threads para as versões paralelas
+    // ── Parâmetros de execução ───────────────────────────────────────────────
+
+    // Número de threads para os modos paralelos em CPU (threads POSIX)
     const int num_threads = 8;
 
-    // Define o número de arquivos de entrada e seus tamanhos
+    // Número de threads por bloco CUDA para o Radix Sort GPU.
+    // Deve ser potência de 2 entre 32 e 1024.
+    // Valores sugeridos para experimentação: 64, 128, 256, 512, 1024.
+    // Impacto: blocos maiores reduzem num_blocos e o tamanho da matriz de
+    // contagens, diminuindo o trabalho do PrefixSumKernel.
+    // Shared memory usada: 3 × threads_por_bloco_cuda × 4 bytes por bloco.
+    // Com 1024: 12KB/bloco — dentro do limite de 48KB do sm_86.
+    const int threads_por_bloco_cuda = 1024;
+
+    // ── Arquivos de entrada ──────────────────────────────────────────────────
+
     const int num_entradas = 11;
 
     const long tamanho_arquivos[num_entradas] = {
@@ -42,27 +55,21 @@ int main()
         25000000, 50000000, 100000000
     };
 
-    // Define os caminhos dos arquivos binários de entrada
-    const char *entradas[num_entradas] =
-    {
+    const char *entradas[num_entradas] = {
         "dados/250k.bin", "dados/500k.bin", "dados/750k.bin", "dados/1m.bin",
         "dados/2m500.bin", "dados/5m.bin", "dados/7m500.bin", "dados/10m.bin",
         "dados/25m.bin", "dados/50m.bin", "dados/100m.bin"
-
     };
 
-    // Cria e inicializa o arquivo CSV para registrar os tempos de execução
+    // ── Inicializa CSV ───────────────────────────────────────────────────────
     FILE *csv = fopen("results/tempos.csv", "w");
-    if (!csv) {
-        perror("Erro ao abrir arquivo CSV para escrita");
-        return 1;
-    }
+    if (!csv) { perror("Erro ao abrir arquivo CSV para escrita"); return 1; }
     fprintf(csv, "Algoritmo,Tamanho,Tempo\n");
     fclose(csv);
 
     /*
-        Para cada algoritmo: 
-            - gera os arquivos binarios com dados aleatórios
+        Para cada algoritmo:
+            - gera os arquivos binários com dados aleatórios
             - executa a ordenação
             - verifica se os arquivos estão ordenados corretamente
     */
@@ -72,29 +79,30 @@ int main()
     ExecMergeSeq(entradas, num_entradas, "results/tempos.csv");
     VerificarOrdenado(entradas, num_entradas);
 
-    // Merge Sort com Threads (Não finalizado)
+    // Merge Sort com Threads
     GerarArquivos(tamanho_arquivos, entradas, num_entradas);
     ExecMergeThread(entradas, num_entradas, num_threads, "results/tempos.csv");
-    VerificarOrdenado(entradas,num_entradas);
+    VerificarOrdenado(entradas, num_entradas);
 
     // Merge Sort com CUDA (GPU)
     GerarArquivos(tamanho_arquivos, entradas, num_entradas);
     ExecMergeCuda(entradas, num_entradas, "results/tempos.csv");
-    VerificarOrdenado(entradas,num_entradas);
-    
+    VerificarOrdenado(entradas, num_entradas);
+
     // Radix Sort Sequencial
     GerarArquivos(tamanho_arquivos, entradas, num_entradas);
     ExecRadixSeq(entradas, num_entradas, "results/tempos.csv");
     VerificarOrdenado(entradas, num_entradas);
 
-    // Radix Sort com Threads **(WIP)
-    // GerarArquivosUtils(tamanho_arquivos, entradas, num_entradas);
-    // ExecRadixThread(entradas, num_entradas, num_threads, "results/tempos.csv");
-    // VerificarOrdenado(entradas,num_entradas);   
+    // Radix Sort com Threads
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecRadixThread(entradas, num_entradas, num_threads, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
 
-    // Radix Sort com CUDA (GPU) **(WIP)
-    // GerarArquivosUtils(tamanho_arquivos, entradas, num_entradas);
-    // ExecRadixCuda(entradas, num_entradas, "results/tempos.csv");
-    // VerificarOrdenado(entradas,num_entradas);
+    // Radix Sort com CUDA (GPU)
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecRadixCuda(entradas, num_entradas, threads_por_bloco_cuda, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
 
+    return 0;
 }

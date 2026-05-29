@@ -1,8 +1,8 @@
-#include <stdlib.h>
+#include <iostream>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <chrono>
-#include <iostream>
 
 using namespace std;
 
@@ -10,184 +10,156 @@ using namespace std;
 //                  Observações gerais
 // ============================================================
 /*
-    Este arquivo implementa o algoritmo Radix Sort de forma sequencial na CPU.
+    Este arquivo implementa o algoritmo Radix Sort LSD de forma sequencial na CPU.
     O fluxo geral é:
         1) Ler vetores de arquivos binários (int)
-        2) Ordenar os dados usando Radix Sort (base decimal)
+        2) Ordenar os dados usando Radix Sort LSD (base 256)
         3) Medir o tempo de execução
         4) Regravar o arquivo com os dados ordenados
         5) Registrar tempos em CSV
 
     O Radix Sort é um algoritmo de ordenação não-comparativo que ordena inteiros
-    processando cada dígito individualmente, da menor para a maior posição (unidades,
-    dezenas, centenas, etc). Para cada posição, utiliza o Counting Sort como sub-rotina
-    estável para garantir a ordenação correta.
+    processando cada byte individualmente, do menos significativo para o mais
+    significativo (LSD — Least Significant Digit first).
+
+    DECISÃO DE DESIGN — Base 256 (1 byte por passagem):
+        Inteiros de 32 bits possuem exatamente 4 bytes, logo o algoritmo sempre
+        realiza exatamente 4 passagens, independentemente dos valores presentes
+        no vetor. Isso garante comportamento previsível e comparável entre os
+        modos sequencial, threads e CUDA.
+
+    OTIMIZAÇÃO — Alternância de ponteiros (ping-pong) sem cópia final:
+        A versão anterior copiava o buffer de volta para o vetor ao final de
+        cada passagem (O(n) de cópia por passagem = 4n cópias extras no total).
+        A versão atual alterna os papéis de 'entrada' e 'saida' a cada passagem:
+        passagem 1: lê de vetor,  escreve em buffer
+        passagem 2: lê de buffer, escreve em vetor
+        passagem 3: lê de vetor,  escreve em buffer
+        passagem 4: lê de buffer, escreve em vetor  ← resultado final em vetor
+        Após 4 passagens (número par), o resultado está sempre em 'vetor',
+        sem nenhuma cópia adicional.
 */
 
 // ============================================================
-//                  FUNÇÃO COUNTING SORT (AUXILIAR)
+//              FUNÇÃO COUNTING SORT POR BYTE (AUXILIAR)
 // ============================================================
 /*
- * CountingSort: ordena o vetor de inteiros considerando apenas o dígito
- * correspondente à posição indicada por 'expoente' (1=unidades, 10=dezenas, ...).
+ * CountingSortByte: ordena os elementos de 'entrada' para 'saida' considerando
+ * apenas o byte indicado por 'shift'.
  *
  * Parâmetros:
- * - vetor:    ponteiro para o array de inteiros a ser ordenado
- * - tamanho:  número de elementos no array
- * - expoente: potência de 10 que indica qual dígito será usado na ordenação
+ * - entrada: ponteiro para o array de origem (somente leitura nesta passagem)
+ * - saida:   ponteiro para o array de destino (resultado desta passagem)
+ * - n:       número de elementos
+ * - shift:   número de bits a deslocar para isolar o byte (0, 8, 16 ou 24)
  *
- * Funcionamento:
- * - Conta quantas vezes cada dígito (0-9) aparece na posição 'expoente'
- * - Calcula a posição final de cada elemento usando contagem cumulativa
- * - Reorganiza o vetor de acordo com o dígito atual
- * - Copia o resultado ordenado de volta para o vetor original
+ * Não copia de volta para entrada — isso é responsabilidade do chamador
+ * via alternância de ponteiros.
  */
-void CountingSort(int *vetor, int tamanho, int expoente) 
+void CountingSortByte(int *entrada, int *saida, int n, int shift)
 {
-    int *saida = new int[tamanho]; // vetor auxiliar para saída ordenada
-    int count[10] = {0};           // contadores para cada dígito (0-9)
+    int contagem[256] = {0};
 
-    // Conta a ocorrência de cada dígito na posição 'expoente'
-    for (int i = 0; i < tamanho; i++)
+    // Conta a ocorrência de cada valor do byte na posição 'shift'
+    int i = 0;
+    while (i < n)
     {
-        count[(vetor[i] / expoente) % 10]++;
+        contagem[(entrada[i] >> shift) & 0xFF]++;
+        i++;
     }
 
-    // Atualiza count[i] para que ele contenha a posição real do dígito no vetor de saída
-    for (int i = 1; i < 10; i++)
+    // Prefix sum: contagem[b] passa a indicar a posição inicial do bucket b
+    i = 1;
+    while (i < 256)
     {
-        count[i] += count[i - 1];
+        contagem[i] += contagem[i - 1];
+        i++;
     }
 
-    // Constrói o vetor de saída ordenando pelos dígitos atuais
-    for (int i = tamanho - 1; i >= 0; i--) 
+    // Distribui de trás para frente para preservar estabilidade
+    i = n - 1;
+    while (i >= 0)
     {
-        saida[count[(vetor[i] / expoente) % 10] - 1] = vetor[i];
-        count[(vetor[i] / expoente) % 10]--;
+        int valor_byte = (entrada[i] >> shift) & 0xFF;
+        saida[--contagem[valor_byte]] = entrada[i];
+        i--;
     }
-
-    // Copia o resultado ordenado de volta para o vetor original
-    for (int i = 0; i < tamanho; i++)
-    {
-        vetor[i] = saida[i];
-    }
-
-    delete[] saida; // libera memória auxiliar
 }
 
 // ============================================================
 //                  FUNÇÃO PRINCIPAL RADIX SORT
 // ============================================================
 /*
- * RadixSort: ordena um vetor de inteiros.
+ * RadixSortSeq: ordena um vetor de inteiros usando Radix Sort LSD com base 256.
  *
  * Parâmetros:
  * - vetor: ponteiro para o array de inteiros a ser ordenado
- * - tamanho: número de elementos no array
+ * - n:     número de elementos no array
  *
  * Funcionamento:
- * - Encontra o maior valor do vetor para determinar o número de dígitos
- * - Para cada posição decimal (expoente = 1, 10, 100, ...), chama CountingSort
- *   para ordenar os elementos de acordo com o dígito atual
- * - Repete até que todos os dígitos do maior número tenham sido processados
+ * - Aloca um único buffer auxiliar de tamanho n.
+ * - Alterna os papéis de entrada e saída a cada passagem (ping-pong),
+ *   eliminando a cópia buffer→vetor da versão anterior.
+ * - Após 4 passagens (número par), o resultado está sempre em 'vetor'.
+ *
+ * Complexidade: O(4n) tempo, O(n) espaço extra.
  */
-void RadixSort(int *vetor, int tamanho) 
+void RadixSortSeq(int *vetor, int n)
 {
-    int max = vetor[0];
-    // Encontra o maior elemento para saber quantos dígitos processar
-    for (int i = 1; i < tamanho; i++)
-    {
-        if (vetor[i] > max)
-        {
-            max = vetor[i];
-        }
-    }
+    int *buffer = new int[n];
 
-    // Ordena por cada dígito, da menor para a maior posição decimal
-    for (int expoente = 1; max / expoente > 0; expoente *= 10)
+    // Ponteiros que alternam entre vetor e buffer a cada passagem
+    int *entrada = vetor;
+    int *saida   = buffer;
+
+    int shift = 0;
+    while (shift < 32)
     {
-        CountingSort(vetor, tamanho, expoente);
+        CountingSortByte(entrada, saida, n, shift);
+
+        // Troca os papéis: saída desta passagem vira entrada da próxima
+        int *temp = entrada;
+        entrada   = saida;
+        saida     = temp;
+
+        shift += 8;
     }
+    // Após 4 trocas (par), entrada == vetor → resultado já está em vetor
+
+    delete[] buffer;
 }
 
 // ============================================================
 //             FUNÇÃO DE EXECUÇÃO E MEDIÇÃO DE TEMPO
 // ============================================================
 /*
- * ExecRadixSeq: executa o Radix Sort sequencial nos arquivos binários
- * mede o tempo de ordenação e registra os resultados em CSV.
- *
- * Parâmetros:
- * - entradas: array de caminhos (const char*) para arquivos binários
- * - num_entradas: número de entradas no array
- * - csv_saida: caminho do arquivo CSV de saída onde serão registrados os tempos
- *
- * Funcionamento:
- * - Para cada arquivo:
- *     - Abre o arquivo e determina o número de inteiros
- *     - Lê os dados para um vetor alocado dinamicamente
- *     - Mede o tempo de ordenação usando chrono
- *     - Ordena os dados com RadixSort
- *     - Registra o tempo no arquivo CSV
- *     - Regrava o arquivo com os dados ordenados
- *     - Libera memória utilizada
+ * ExecRadixSeq: executa o Radix Sort sequencial para múltiplos arquivos binários
+ * contendo inteiros, mede o tempo de ordenação e registra os resultados em CSV.
  */
 void ExecRadixSeq(const char **entradas, int num_entradas, const char *csv_saida)
 {
-    FILE *csv = fopen(csv_saida, "a");
-    if (!csv)
+    FILE *csv = AbrirCSV(csv_saida);
+    if (!csv) return;
+
+    for (int i = 0; i < num_entradas; i++)
     {
-        perror("Erro ao abrir arquivo CSV");
-        return;
-    }
+        long tamanho;
+        int *vetor;
+        FILE *file = LerVetor(entradas[i], &vetor, &tamanho);
+        if (!file) continue;
 
-    for(int i = 0; i < num_entradas; i++)
-    {
-        FILE *file = fopen(entradas[i], "rb+");
-        if(!file)
-        {
-            perror(entradas[i]);
-            continue;
-        }
+        auto inicio = chrono::high_resolution_clock::now();
+        RadixSortSeq(vetor, tamanho);
+        auto fim = chrono::high_resolution_clock::now();
 
-        // Determina o número de inteiros no arquivo
-        fseek(file, 0, SEEK_END);
-        long tamanho = ftell(file) / sizeof(int);
-        fseek(file, 0, SEEK_SET);
+        chrono::duration<double> decorrido = fim - inicio;
+        double tempo = decorrido.count();
 
-        int *v = new int[tamanho];
-        if(fread(v, sizeof(int), tamanho, file) != (size_t)tamanho)
-        {
-            perror("Erro ao ler o arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
+        printf("Radix Sort Sequencial - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
+        fprintf(csv, "RadixSort - Sequencial,%ld,%f\n", tamanho, tempo);
 
-        // Mede o tempo de ordenação usando chrono
-        auto start = chrono::high_resolution_clock::now();
-        RadixSort(v, tamanho);
-        auto end = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = end - start;
-        double tempo = elapsed.count();
-
-        printf("Radix Sort Sequencial - Tempo para ordenar %s: %f segundos\n", entradas[i], tempo);
-
-        // Registra tempo e tamanho no arquivo CSV
-        fprintf(csv, "RadixSort Sequencial,%ld,%f\n", (size_t)tamanho, tempo);
-
-        // Regrava o arquivo com os dados ordenados
-        fseek(file, 0, SEEK_SET);
-        if(fwrite(v, sizeof(int), tamanho, file) != tamanho)
-        {
-            perror("Erro ao escrever no arquivo");
-            fclose(file);
-            delete[] v;
-            continue;
-        }
-
-        fclose(file);
-        delete[] v;
+        GravarEFechar(file, vetor, tamanho);
+        delete[] vetor;
     }
 
     fclose(csv);
