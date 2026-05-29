@@ -10,121 +10,61 @@ using namespace std;
 //                  Observações gerais
 // ============================================================
 /*
-    Este arquivo implementa o algoritmo Radix Sort LSD de forma sequencial na CPU.
-    O fluxo geral é:
-        1) Ler vetores de arquivos binários (int)
-        2) Ordenar os dados usando Radix Sort LSD (base 256)
-        3) Medir o tempo de execução
-        4) Regravar o arquivo com os dados ordenados
-        5) Registrar tempos em CSV
+    Radix Sort LSD sequencial com base 256 (1 byte por passagem).
 
-    O Radix Sort é um algoritmo de ordenação não-comparativo que ordena inteiros
-    processando cada byte individualmente, do menos significativo para o mais
-    significativo (LSD — Least Significant Digit first).
+    Estrutura de cada passagem:
+        1) Contagem:    conta quantos elementos têm cada valor de byte
+        2) Prefix sum:  converte contagem em posição inicial de cada bucket
+        3) Distribuição: copia elementos para a posição correta (de trás
+                         para frente, garantindo estabilidade)
 
-    DECISÃO DE DESIGN — Base 256 (1 byte por passagem):
-        Inteiros de 32 bits possuem exatamente 4 bytes, logo o algoritmo sempre
-        realiza exatamente 4 passagens, independentemente dos valores presentes
-        no vetor. Isso garante comportamento previsível e comparável entre os
-        modos sequencial, threads e CUDA.
-
-    OTIMIZAÇÃO — Alternância de ponteiros (ping-pong) sem cópia final:
-        A versão anterior copiava o buffer de volta para o vetor ao final de
-        cada passagem (O(n) de cópia por passagem = 4n cópias extras no total).
-        A versão atual alterna os papéis de 'entrada' e 'saida' a cada passagem:
-        passagem 1: lê de vetor,  escreve em buffer
-        passagem 2: lê de buffer, escreve em vetor
-        passagem 3: lê de vetor,  escreve em buffer
-        passagem 4: lê de buffer, escreve em vetor  ← resultado final em vetor
-        Após 4 passagens (número par), o resultado está sempre em 'vetor',
-        sem nenhuma cópia adicional.
+    Alternância de ponteiros (ping-pong):
+        Após cada passagem, entrada e saída trocam de papel.
+        Com 4 passagens (número par), o resultado sempre volta para 'vetor'.
 */
 
 // ============================================================
-//              FUNÇÃO COUNTING SORT POR BYTE (AUXILIAR)
+//              COUNTING SORT POR BYTE (UMA PASSAGEM)
 // ============================================================
-/*
- * CountingSortByte: ordena os elementos de 'entrada' para 'saida' considerando
- * apenas o byte indicado por 'shift'.
- *
- * Parâmetros:
- * - entrada: ponteiro para o array de origem (somente leitura nesta passagem)
- * - saida:   ponteiro para o array de destino (resultado desta passagem)
- * - n:       número de elementos
- * - shift:   número de bits a deslocar para isolar o byte (0, 8, 16 ou 24)
- *
- * Não copia de volta para entrada — isso é responsabilidade do chamador
- * via alternância de ponteiros.
- */
 void CountingSortByte(int *entrada, int *saida, int n, int shift)
 {
     int contagem[256] = {0};
 
-    // Conta a ocorrência de cada valor do byte na posição 'shift'
-    int i = 0;
-    while (i < n)
-    {
+    // Fase 1: conta ocorrências de cada valor de byte
+    for (int i = 0; i < n; i++)
         contagem[(entrada[i] >> shift) & 0xFF]++;
-        i++;
-    }
 
-    // Prefix sum: contagem[b] passa a indicar a posição inicial do bucket b
-    i = 1;
-    while (i < 256)
-    {
+    // Fase 2: prefix sum — contagem[b] passa a ser a última posição do bucket b
+    for (int i = 1; i < 256; i++)
         contagem[i] += contagem[i - 1];
-        i++;
-    }
 
-    // Distribui de trás para frente para preservar estabilidade
-    i = n - 1;
-    while (i >= 0)
+    // Fase 3: distribui de trás para frente (estável)
+    for (int i = n - 1; i >= 0; i--)
     {
-        int valor_byte = (entrada[i] >> shift) & 0xFF;
-        saida[--contagem[valor_byte]] = entrada[i];
-        i--;
+        int b = (entrada[i] >> shift) & 0xFF;
+        saida[--contagem[b]] = entrada[i];
     }
 }
 
 // ============================================================
-//                  FUNÇÃO PRINCIPAL RADIX SORT
+//                  RADIX SORT SEQUENCIAL
 // ============================================================
-/*
- * RadixSortSeq: ordena um vetor de inteiros usando Radix Sort LSD com base 256.
- *
- * Parâmetros:
- * - vetor: ponteiro para o array de inteiros a ser ordenado
- * - n:     número de elementos no array
- *
- * Funcionamento:
- * - Aloca um único buffer auxiliar de tamanho n.
- * - Alterna os papéis de entrada e saída a cada passagem (ping-pong),
- *   eliminando a cópia buffer→vetor da versão anterior.
- * - Após 4 passagens (número par), o resultado está sempre em 'vetor'.
- *
- * Complexidade: O(4n) tempo, O(n) espaço extra.
- */
 void RadixSortSeq(int *vetor, int n)
 {
-    int *buffer = new int[n];
-
-    // Ponteiros que alternam entre vetor e buffer a cada passagem
+    int *buffer  = new int[n];
     int *entrada = vetor;
     int *saida   = buffer;
 
-    int shift = 0;
-    while (shift < 32)
+    for (int shift = 0; shift < 32; shift += 8)
     {
         CountingSortByte(entrada, saida, n, shift);
 
-        // Troca os papéis: saída desta passagem vira entrada da próxima
+        // Troca os ponteiros: saída desta passagem vira entrada da próxima
         int *temp = entrada;
         entrada   = saida;
         saida     = temp;
-
-        shift += 8;
     }
-    // Após 4 trocas (par), entrada == vetor → resultado já está em vetor
+    // Após 4 trocas (par), 'entrada' == 'vetor' — resultado já está em vetor
 
     delete[] buffer;
 }
@@ -132,10 +72,6 @@ void RadixSortSeq(int *vetor, int n)
 // ============================================================
 //             FUNÇÃO DE EXECUÇÃO E MEDIÇÃO DE TEMPO
 // ============================================================
-/*
- * ExecRadixSeq: executa o Radix Sort sequencial para múltiplos arquivos binários
- * contendo inteiros, mede o tempo de ordenação e registra os resultados em CSV.
- */
 void ExecRadixSeq(const char **entradas, int num_entradas, const char *csv_saida)
 {
     FILE *csv = AbrirCSV(csv_saida);

@@ -3,8 +3,8 @@
 // ============================================================
 /*
     Este é o arquivo principal do projeto, responsável por orquestrar a execução
-    dos algoritmos de ordenação (Merge Sort e Radix Sort) em diferentes versões:
-    sequencial, com threads POSIX e com CUDA (GPU).
+    dos algoritmos de ordenação (Merge Sort, Radix Sort e Bitonic Sort) em diferentes
+    versões: sequencial, com threads POSIX e com CUDA (GPU).
 
     O fluxo geral é:
         1. Define os arquivos de entrada e seus tamanhos
@@ -25,6 +25,10 @@
 #include "ordenadores/sequencial/radix_sort_seq.h"
 #include "ordenadores/threads/radix_sort_threads.h"
 #include "ordenadores/cuda/radix_sort_cuda.cu"
+#include "ordenadores/cuda/radix_sort_cuda_otimizado.cu"
+#include "ordenadores/sequencial/bitonic_sort_seq.h"
+#include "ordenadores/threads/bitonic_sort_threads.h"
+#include "ordenadores/cuda/bitonic_sort_cuda.cu"
 
 // ============================================================
 //                  Função principal
@@ -102,6 +106,26 @@ int main()
     // Radix Sort com CUDA (GPU)
     GerarArquivos(tamanho_arquivos, entradas, num_entradas);
     ExecRadixCuda(entradas, num_entradas, threads_por_bloco_cuda, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
+
+    // Radix Sort com CUDA Otimizado (warp ballot + shared memory atomics)
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecRadixCudaOtim(entradas, num_entradas, threads_por_bloco_cuda, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
+
+    // Bitonic Sort Sequencial
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecBitonicSeq(entradas, num_entradas, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
+
+    // Bitonic Sort com Threads
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecBitonicThread(entradas, num_entradas, num_threads, "results/tempos.csv");
+    VerificarOrdenado(entradas, num_entradas);
+
+    // Bitonic Sort com CUDA (GPU)
+    GerarArquivos(tamanho_arquivos, entradas, num_entradas);
+    ExecBitonicCuda(entradas, num_entradas, "results/tempos.csv");
     VerificarOrdenado(entradas, num_entradas);
 
     return 0;

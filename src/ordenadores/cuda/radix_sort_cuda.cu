@@ -11,76 +11,59 @@ using namespace std;
 //                  Observações gerais
 // ============================================================
 /*
-    Este arquivo implementa o algoritmo Radix Sort LSD paralelo na GPU via CUDA.
+    Radix Sort LSD paralelo na GPU via CUDA, base 256 (1 byte por passagem).
 
-    DECISÃO DE DESIGN — Base 256 (1 byte por passagem):
-        4 passagens fixas para inteiros de 32 bits, comparável entre os 3 modos.
-
-    DECISÃO DE DESIGN — Estrutura de cada passagem:
+    Cada passagem segue a mesma estrutura dos modos sequencial e threads:
 
         Fase 1 — ContagemKernel (GPU):
-            Cada thread conta o byte do seu elemento e acumula via atomicAdd
-            na linha do seu bloco na matriz contagens[num_blocos][256].
+            Cada thread incrementa via atomicAdd em contagens[bloco][256].
+            Cada bloco escreve apenas na sua própria linha — sem contenção
+            entre blocos. Equivalente à "contagem local" de cada thread.
 
-        Fase 2 — Prefix sum e offsets (CPU):
-            A CPU transfere a matriz de contagens (D→H), calcula prefixo[256]
-            e offsets[num_blocos][256], e os envia de volta (H→D).
+        Fase 2 — PrefixSumKernel (GPU) + prefixo global (CPU):
+            Um único bloco de 256 threads percorre contagens[*][b] e produz
+            offsets[bloco][b] (posição do bloco dentro do bucket b).
+            Apenas totais[256] (1KB) vai para a CPU calcular prefixo[256]
+            e volta. Equivalente ao "Thread 0 faz prefix sum".
 
-        Fase 3 — DistribuicaoKernel (GPU, com shared memory):
-            Cada bloco carrega sua fatia em shared memory e faz um prefix sum
-            local (Hillis-Steele) para calcular o rank de cada elemento dentro
-            do bloco em O(log P) em vez de O(P). A posição final é:
-                prefixo[b] + offsets[bloco][b] + rank_local
-            Sem loop linear — sem O(N²) implícito.
+        Fase 3 — DistribuicaoKernel (GPU):
+            Todos os threads carregam sua faixa em shared memory (leitura
+            coalescida). A thread 0 distribui os elementos em ordem, de forma
+            estável. O paralelismo vem dos ~100k blocos simultâneos na GPU.
+            Equivalente à "distribuição" de cada thread no modo threads.
 
-        Swap de ponteiros após cada passagem (sem cópia de dados).
+        Swap de ponteiros após cada passagem.
         Após 4 passagens (par), resultado em dados_device original.
-
-    OTIMIZAÇÃO — Shared memory no DistribuicaoKernel:
-        A versão anterior calculava rank_local com um loop de até P iterações
-        por thread lendo de global memory → complexidade O(N×P).
-        A versão atual usa prefix sum em shared memory → O(N×log P).
-        Para P=256: redução de 256 para 8 operações por thread (~32x).
-
-    DECISÃO DE DESIGN — Threads por bloco como parâmetro:
-        O número de threads por bloco é configurável via parâmetro em ExecRadixCuda,
-        permitindo experimentar sem recompilar. Deve ser potência de 2 (32..1024).
 
     DECISÃO DE DESIGN — Pinned memory no host:
         cudaMallocHost garante transferências H↔D via DMA direto.
+
+    DECISÃO DE DESIGN — Threads por bloco como parâmetro:
+        Configurável via parâmetro em ExecRadixCuda (potência de 2, 32..1024).
 */
 
 // ============================================================
 //              KERNEL DE CONTAGEM (FASE 1)
 // ============================================================
 /*
- * ContagemKernel: cada thread conta o byte do seu elemento e acumula
- * via atomicAdd na linha do seu bloco na matriz de contagens.
+ * ContagemKernel: cada thread incrementa via atomicAdd o contador do seu
+ * byte na linha do seu bloco em contagens[bloco][256].
  */
 __global__ void ContagemKernel(int *dados, int *contagens, int n, int shift)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-
-    int valor_byte = (dados[idx] >> shift) & 0xFF;
-    atomicAdd(&contagens[blockIdx.x * 256 + valor_byte], 1);
+    atomicAdd(&contagens[blockIdx.x * 256 + ((dados[idx] >> shift) & 0xFF)], 1);
 }
 
 // ============================================================
 //              KERNEL DE PREFIX SUM DE OFFSETS (FASE 2)
 // ============================================================
 /*
- * PrefixSumKernel: para cada bucket b, calcula o prefix sum exclusivo de
- * contagens[0..num_blocos-1][b], produzindo offsets[bloco][b] e totais[b].
+ * PrefixSumKernel: para cada bucket b, percorre todos os blocos e calcula
+ * offsets[bloco][b] (prefix sum exclusivo) e totais[b] (contagem global).
  *
  * Lançamento: <<<1, 256>>> — 1 bloco, 256 threads, uma por bucket.
- *
- * Acesso coalesced: em cada iteração do loop, os 256 threads acessam
- * contagens[bloco*256 + 0..255] — posições consecutivas na memória.
- *
- * Substitui a transferência D→H de contagens (~100MB) + cálculo de offsets
- * na CPU + transferência H→D de offsets (~100MB) por passagem.
- * Apenas totais[256] (1KB) é transferido D→H para calcular o prefixo global.
  */
 __global__ void PrefixSumKernel(int *contagens, int *totais, int *offsets, int num_blocos)
 {
@@ -88,12 +71,10 @@ __global__ void PrefixSumKernel(int *contagens, int *totais, int *offsets, int n
     if (b >= 256) return;
 
     int acc = 0;
-    int bloco = 0;
-    while (bloco < num_blocos)
+    for (int bloco = 0; bloco < num_blocos; bloco++)
     {
         offsets[bloco * 256 + b] = acc;
         acc += contagens[bloco * 256 + b];
-        bloco++;
     }
     totais[b] = acc;
 }
@@ -102,119 +83,48 @@ __global__ void PrefixSumKernel(int *contagens, int *totais, int *offsets, int n
 //              KERNEL DE DISTRIBUIÇÃO (FASE 3)
 // ============================================================
 /*
- * DistribuicaoKernel: cada thread calcula seu rank_local via prefix sum
- * em shared memory e escreve seu elemento na posição correta do buffer.
+ * DistribuicaoKernel: todos os threads carregam seus dados em shared memory
+ * (leitura coalescida). A thread 0 distribui os elementos em ordem, garantindo
+ * estabilidade. Cada bloco escreve em sub-regiões exclusivas do buffer —
+ * sem condição de corrida entre blocos.
  *
- * Parâmetros:
- * - dados:          vetor de entrada na GPU
- * - buffer:         buffer de saída na GPU
- * - prefixo:        array [256] — posição inicial de cada bucket no buffer
- * - offsets:        matriz [num_blocos][256] — offset acumulado por bloco/bucket
- * - n:              tamanho total do vetor
- * - shift:          byte sendo processado
- *
- * Algoritmo por bloco (em shared memory):
- *   1) Cada thread carrega seu elemento e extrai valor_byte
- *   2) Para cada bucket b (0..255):
- *        - Cada thread marca s_mask[t] = (valor_byte_da_thread == b) ? 1 : 0
- *        - Prefix sum exclusivo de s_mask via Hillis-Steele → s_scan[t]
- *        - s_scan[t] é o rank_local desta thread para o bucket b
- *   3) A thread escreve seu elemento usando rank correspondente ao seu bucket
- *
- * ATENÇÃO — por que iterar sobre todos os 256 buckets:
- *   Cada thread participa do prefix sum de todos os buckets, mas só usa
- *   o resultado do bucket correspondente ao seu próprio valor_byte.
- *   Isso é necessário pois __syncthreads() é uma barreira coletiva —
- *   todas as threads do bloco precisam participar de cada iteração.
- *
- * ATENÇÃO — shared memory necessária:
- *   s_dados[blockDim.x] + s_mask[blockDim.x] + s_scan[blockDim.x]
- *   = 3 × blockDim.x × sizeof(int) bytes por bloco.
- *   Alocado dinamicamente via 'extern __shared__' e passado em shmem_sz.
+ * Shared memory: blockDim.x ints (dados) + 256 ints (posições de escrita).
  */
 __global__ void DistribuicaoKernel(int *dados, int *buffer,
                                    int *prefixo, int *offsets,
                                    int n, int shift)
 {
     extern __shared__ int shmem[];
+    int *s_dados = shmem;               // [blockDim.x]
+    int *s_pos   = shmem + blockDim.x;  // [256]
 
-    int *s_dados = shmem;                          // [blockDim.x] elementos do bloco
-    int *s_mask  = shmem + blockDim.x;             // [blockDim.x] máscara do bucket atual
-    int *s_scan  = shmem + 2 * blockDim.x;         // [blockDim.x] prefix sum da máscara
+    int t   = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + t;
 
-    int idx   = blockIdx.x * blockDim.x + threadIdx.x;
-    int t     = threadIdx.x;
-    int bloco = blockIdx.x;
+    // Todos os threads carregam dados em shared memory (leitura coalescida)
+    s_dados[t] = (idx < n) ? dados[idx] : 0;
 
-    // Carrega o elemento desta thread (0 se fora dos limites)
-    int meu_dado     = (idx < n) ? dados[idx] : -1;
-    int valor_byte   = (idx < n) ? ((meu_dado >> shift) & 0xFF) : -1;
-    s_dados[t]       = meu_dado;
-
+    // Carrega posição inicial de cada bucket para este bloco
+    for (int i = t; i < 256; i += blockDim.x)
+        s_pos[i] = prefixo[i] + offsets[blockIdx.x * 256 + i];
     __syncthreads();
 
-    int rank_local = 0;
-
-    // Para cada bucket b, calcula o prefix sum exclusivo das threads
-    // cujo valor_byte == b, obtendo o rank de cada thread dentro do bucket
-    int b = 0;
-    while (b < 256)
+    // Thread 0 distribui os elementos desta faixa em ordem (estável)
+    if (t == 0)
     {
-        // Marca 1 se esta thread pertence ao bucket b
-        s_mask[t] = (valor_byte == b && idx < n) ? 1 : 0;
-        __syncthreads();
-
-        // Prefix sum exclusivo (Hillis-Steele) em shared memory
-        // Após o loop, s_scan[t] = número de threads com byte==b nos índices [0..t-1]
-        s_scan[t] = s_mask[t];
-        __syncthreads();
-
-        int passo = 1;
-        while (passo < (int)blockDim.x)
+        int lim = min((int)blockDim.x, n - (int)(blockIdx.x * blockDim.x));
+        for (int i = 0; i < lim; i++)
         {
-            int val = (t >= passo) ? s_scan[t - passo] : 0;
-            __syncthreads();
-            s_scan[t] += val;
-            __syncthreads();
-            passo <<= 1;
+            int d = s_dados[i];
+            int b = (d >> shift) & 0xFF;
+            buffer[s_pos[b]++] = d;
         }
-
-        // Converte para prefix sum EXCLUSIVO (rank = quantos antes de mim, não incluindo eu)
-        int rank_b = (t > 0) ? s_scan[t - 1] : 0;
-        __syncthreads();
-
-        // Se esta thread pertence ao bucket b, guarda seu rank
-        if (valor_byte == b && idx < n)
-        {
-            rank_local = rank_b;
-        }
-
-        b++;
-    }
-
-    // Escreve o elemento na posição final do buffer
-    if (idx < n)
-    {
-        int pos_final = prefixo[valor_byte]
-                      + offsets[bloco * 256 + valor_byte]
-                      + rank_local;
-        buffer[pos_final] = meu_dado;
     }
 }
 
 // ============================================================
 //          FUNÇÃO DE CONTROLE DO RADIX SORT (GPU)
 // ============================================================
-/*
- * RadixSortCuda: coordena os kernels e o prefix sum para ordenar em 4 passagens.
- *
- * Parâmetros:
- * - dados_device:        ponteiro-para-ponteiro do vetor de entrada na GPU
- * - buffer_device:       ponteiro-para-ponteiro do buffer de saída na GPU
- * - n:                   tamanho do vetor
- * - num_blocos:          número de blocos CUDA
- * - threads_por_bloco:   número de threads por bloco (potência de 2, 32..1024)
- */
 void RadixSortCuda(int **dados_device, int **buffer_device,
                    int n, int num_blocos, int threads_por_bloco)
 {
@@ -228,22 +138,22 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         return;
     }
 
-    int *prefixo_device = nullptr;
-    err = cudaMalloc(&prefixo_device, 256 * sizeof(int));
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "Erro ao alocar prefixo_device: %s\n", cudaGetErrorString(err));
-        cudaFree(contagens_device);
-        return;
-    }
-
     int *offsets_device = nullptr;
     err = cudaMalloc(&offsets_device, num_blocos * 256 * sizeof(int));
     if (err != cudaSuccess)
     {
         fprintf(stderr, "Erro ao alocar offsets_device: %s\n", cudaGetErrorString(err));
         cudaFree(contagens_device);
-        cudaFree(prefixo_device);
+        return;
+    }
+
+    int *prefixo_device = nullptr;
+    err = cudaMalloc(&prefixo_device, 256 * sizeof(int));
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Erro ao alocar prefixo_device: %s\n", cudaGetErrorString(err));
+        cudaFree(contagens_device);
+        cudaFree(offsets_device);
         return;
     }
 
@@ -253,19 +163,18 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
     {
         fprintf(stderr, "Erro ao alocar totais_device: %s\n", cudaGetErrorString(err));
         cudaFree(contagens_device);
-        cudaFree(prefixo_device);
         cudaFree(offsets_device);
+        cudaFree(prefixo_device);
         return;
     }
 
     int totais_host[256];
     int prefixo_host[256];
 
-    // Shared memory por bloco: 3 arrays de blockDim.x inteiros
-    size_t shmem_sz = 3 * threads_por_bloco * sizeof(int);
+    // Shared memory do DistribuicaoKernel: dados (blockDim.x) + posições (256)
+    size_t shmem_sz = (threads_por_bloco + 256) * sizeof(int);
 
-    int shift = 0;
-    while (shift < 32)
+    for (int shift = 0; shift < 32; shift += 8)
     {
         // ── Fase 1: Contagem ─────────────────────────────────────────────────
         cudaMemset(contagens_device, 0, num_blocos * 256 * sizeof(int));
@@ -281,9 +190,7 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         }
         cudaDeviceSynchronize();
 
-        // ── Fase 2: Prefix sum de offsets na GPU ─────────────────────────────
-        // PrefixSumKernel calcula offsets[num_blocos×256] inteiramente na GPU.
-        // Apenas totais[256] (1KB) é transferido D→H para o prefixo global.
+        // ── Fase 2: Prefix sum de offsets na GPU + prefixo global na CPU ─────
         PrefixSumKernel<<<1, 256>>>(contagens_device, totais_device, offsets_device, num_blocos);
 
         err = cudaGetLastError();
@@ -294,19 +201,16 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         }
         cudaDeviceSynchronize();
 
+        // Apenas 1KB (totais[256]) atravessa o barramento PCIe por passagem
         cudaMemcpy(totais_host, totais_device, 256 * sizeof(int), cudaMemcpyDeviceToHost);
 
         prefixo_host[0] = 0;
-        int b = 1;
-        while (b < 256)
-        {
+        for (int b = 1; b < 256; b++)
             prefixo_host[b] = prefixo_host[b - 1] + totais_host[b - 1];
-            b++;
-        }
 
         cudaMemcpy(prefixo_device, prefixo_host, 256 * sizeof(int), cudaMemcpyHostToDevice);
 
-        // ── Fase 3: Distribuição (GPU, shared memory) ────────────────────────
+        // ── Fase 3: Distribuição ─────────────────────────────────────────────
         DistribuicaoKernel<<<num_blocos, threads_por_bloco, shmem_sz>>>(
             *dados_device, *buffer_device,
             prefixo_device, offsets_device,
@@ -324,13 +228,11 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         int *temp      = *dados_device;
         *dados_device  = *buffer_device;
         *buffer_device = temp;
-
-        shift += 8;
     }
 
     cudaFree(contagens_device);
-    cudaFree(prefixo_device);
     cudaFree(offsets_device);
+    cudaFree(prefixo_device);
     cudaFree(totais_device);
 }
 
@@ -375,9 +277,7 @@ void HostParaDeviceRadix(int *dados_host, int n, int threads_por_bloco)
     // Após 4 passagens (par), dados_device contém o resultado ordenado
     err = cudaMemcpy(dados_host, dados_device, n * sizeof(int), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
-    {
         fprintf(stderr, "Erro em cudaMemcpy Device->Host (n=%d): %s\n", n, cudaGetErrorString(err));
-    }
 
     cudaFree(dados_device);
     cudaFree(buffer_device);
@@ -386,15 +286,6 @@ void HostParaDeviceRadix(int *dados_host, int n, int threads_por_bloco)
 // ============================================================
 //             FUNÇÃO DE EXECUÇÃO E MEDIÇÃO DE TEMPO
 // ============================================================
-/*
- * ExecRadixCuda: executa o Radix Sort CUDA para múltiplos arquivos binários.
- *
- * Parâmetros:
- * - entradas:          array de caminhos para arquivos binários
- * - num_entradas:      número de arquivos
- * - threads_por_bloco: threads por bloco CUDA (potência de 2, ex: 128, 256, 512)
- * - csv_saida:         caminho do arquivo CSV de saída
- */
 void ExecRadixCuda(const char **entradas, int num_entradas,
                    int threads_por_bloco, const char *csv_saida)
 {
@@ -416,8 +307,7 @@ void ExecRadixCuda(const char **entradas, int num_entradas,
         err = cudaMallocHost(&vetor, tamanho * sizeof(int));
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "Erro ao alocar pinned memory (N=%ld): %s\n",
-                    tamanho, cudaGetErrorString(err));
+            fprintf(stderr, "Erro ao alocar pinned memory (N=%ld): %s\n", tamanho, cudaGetErrorString(err));
             fclose(file);
             continue;
         }
