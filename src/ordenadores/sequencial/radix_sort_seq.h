@@ -26,38 +26,38 @@ using namespace std;
 // ============================================================
 //              COUNTING SORT POR BYTE (UMA PASSAGEM)
 // ============================================================
-void CountingSortByte(int *entrada, int *saida, int n, int shift)
+void CountingSortByte(int *entrada, int *saida, int num_elementos, int shift)
 {
     int contagem[256] = {0};
 
     // Fase 1: conta ocorrências de cada valor de byte
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < num_elementos; i++)
         contagem[(entrada[i] >> shift) & 0xFF]++;
 
-    // Fase 2: prefix sum — contagem[b] passa a ser a última posição do bucket b
+    // Fase 2: prefix sum — contagem[bucket] passa a ser a última posição do bucket
     for (int i = 1; i < 256; i++)
         contagem[i] += contagem[i - 1];
 
     // Fase 3: distribui de trás para frente (estável)
-    for (int i = n - 1; i >= 0; i--)
+    for (int i = num_elementos - 1; i >= 0; i--)
     {
-        int b = (entrada[i] >> shift) & 0xFF;
-        saida[--contagem[b]] = entrada[i];
+        int bucket = (entrada[i] >> shift) & 0xFF;
+        saida[--contagem[bucket]] = entrada[i];
     }
 }
 
 // ============================================================
 //                  RADIX SORT SEQUENCIAL
 // ============================================================
-void RadixSortSeq(int *vetor, int n)
+void RadixSortSeq(int *vetor, int num_elementos)
 {
-    int *buffer  = new int[n];
+    int *buffer  = new int[num_elementos];
     int *entrada = vetor;
     int *saida   = buffer;
 
     for (int shift = 0; shift < 32; shift += 8)
     {
-        CountingSortByte(entrada, saida, n, shift);
+        CountingSortByte(entrada, saida, num_elementos, shift);
 
         // Troca os ponteiros: saída desta passagem vira entrada da próxima
         int *temp = entrada;

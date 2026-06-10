@@ -21,8 +21,8 @@ using namespace std;
             entre blocos. Equivalente à "contagem local" de cada thread.
 
         Fase 2 — PrefixSumKernel (GPU) + prefixo global (CPU):
-            Um único bloco de 256 threads percorre contagens[*][b] e produz
-            offsets[bloco][b] (posição do bloco dentro do bucket b).
+            Um único bloco de 256 threads percorre contagens[*][bucket] e produz
+            offsets[bloco][bucket] (posição do bloco dentro do bucket).
             Apenas totais[256] (1KB) vai para a CPU calcular prefixo[256]
             e volta. Equivalente ao "Thread 0 faz prefix sum".
 
@@ -49,10 +49,10 @@ using namespace std;
  * ContagemKernel: cada thread incrementa via atomicAdd o contador do seu
  * byte na linha do seu bloco em contagens[bloco][256].
  */
-__global__ void ContagemKernel(int *dados, int *contagens, int n, int shift)
+__global__ void ContagemKernel(int *dados, int *contagens, int num_elementos, int shift)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= num_elementos) return;
     atomicAdd(&contagens[blockIdx.x * 256 + ((dados[idx] >> shift) & 0xFF)], 1);
 }
 
@@ -60,23 +60,23 @@ __global__ void ContagemKernel(int *dados, int *contagens, int n, int shift)
 //              KERNEL DE PREFIX SUM DE OFFSETS (FASE 2)
 // ============================================================
 /*
- * PrefixSumKernel: para cada bucket b, percorre todos os blocos e calcula
- * offsets[bloco][b] (prefix sum exclusivo) e totais[b] (contagem global).
+ * PrefixSumKernel: para cada bucket, percorre todos os blocos e calcula
+ * offsets[bloco][bucket] (prefix sum exclusivo) e totais[bucket] (contagem global).
  *
  * Lançamento: <<<1, 256>>> — 1 bloco, 256 threads, uma por bucket.
  */
 __global__ void PrefixSumKernel(int *contagens, int *totais, int *offsets, int num_blocos)
 {
-    int b = threadIdx.x;
-    if (b >= 256) return;
+    int bucket = threadIdx.x;
+    if (bucket >= 256) return;
 
-    int acc = 0;
+    int acumulador = 0;
     for (int bloco = 0; bloco < num_blocos; bloco++)
     {
-        offsets[bloco * 256 + b] = acc;
-        acc += contagens[bloco * 256 + b];
+        offsets[bloco * 256 + bucket] = acumulador;
+        acumulador += contagens[bloco * 256 + bucket];
     }
-    totais[b] = acc;
+    totais[bucket] = acumulador;
 }
 
 // ============================================================
@@ -92,32 +92,32 @@ __global__ void PrefixSumKernel(int *contagens, int *totais, int *offsets, int n
  */
 __global__ void DistribuicaoKernel(int *dados, int *buffer,
                                    int *prefixo, int *offsets,
-                                   int n, int shift)
+                                   int num_elementos, int shift)
 {
     extern __shared__ int shmem[];
     int *s_dados = shmem;               // [blockDim.x]
     int *s_pos   = shmem + blockDim.x;  // [256]
 
-    int t   = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + t;
+    int id_thread = threadIdx.x;
+    int idx       = blockIdx.x * blockDim.x + id_thread;
 
     // Todos os threads carregam dados em shared memory (leitura coalescida)
-    s_dados[t] = (idx < n) ? dados[idx] : 0;
+    s_dados[id_thread] = (idx < num_elementos) ? dados[idx] : 0;
 
     // Carrega posição inicial de cada bucket para este bloco
-    for (int i = t; i < 256; i += blockDim.x)
+    for (int i = id_thread; i < 256; i += blockDim.x)
         s_pos[i] = prefixo[i] + offsets[blockIdx.x * 256 + i];
     __syncthreads();
 
     // Thread 0 distribui os elementos desta faixa em ordem (estável)
-    if (t == 0)
+    if (id_thread == 0)
     {
-        int lim = min((int)blockDim.x, n - (int)(blockIdx.x * blockDim.x));
-        for (int i = 0; i < lim; i++)
+        int limite = min((int)blockDim.x, num_elementos - (int)(blockIdx.x * blockDim.x));
+        for (int i = 0; i < limite; i++)
         {
-            int d = s_dados[i];
-            int b = (d >> shift) & 0xFF;
-            buffer[s_pos[b]++] = d;
+            int elemento = s_dados[i];
+            int bucket   = (elemento >> shift) & 0xFF;
+            buffer[s_pos[bucket]++] = elemento;
         }
     }
 }
@@ -126,7 +126,7 @@ __global__ void DistribuicaoKernel(int *dados, int *buffer,
 //          FUNÇÃO DE CONTROLE DO RADIX SORT (GPU)
 // ============================================================
 void RadixSortCuda(int **dados_device, int **buffer_device,
-                   int n, int num_blocos, int threads_por_bloco)
+                   int num_elementos, int num_blocos, int threads_por_bloco)
 {
     cudaError_t err;
 
@@ -180,7 +180,7 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         cudaMemset(contagens_device, 0, num_blocos * 256 * sizeof(int));
 
         ContagemKernel<<<num_blocos, threads_por_bloco>>>(
-            *dados_device, contagens_device, n, shift);
+            *dados_device, contagens_device, num_elementos, shift);
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -205,8 +205,8 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         cudaMemcpy(totais_host, totais_device, 256 * sizeof(int), cudaMemcpyDeviceToHost);
 
         prefixo_host[0] = 0;
-        for (int b = 1; b < 256; b++)
-            prefixo_host[b] = prefixo_host[b - 1] + totais_host[b - 1];
+        for (int bucket = 1; bucket < 256; bucket++)
+            prefixo_host[bucket] = prefixo_host[bucket - 1] + totais_host[bucket - 1];
 
         cudaMemcpy(prefixo_device, prefixo_host, 256 * sizeof(int), cudaMemcpyHostToDevice);
 
@@ -214,7 +214,7 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
         DistribuicaoKernel<<<num_blocos, threads_por_bloco, shmem_sz>>>(
             *dados_device, *buffer_device,
             prefixo_device, offsets_device,
-            n, shift);
+            num_elementos, shift);
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -239,45 +239,45 @@ void RadixSortCuda(int **dados_device, int **buffer_device,
 // ============================================================
 //    FUNÇÃO HostParaDeviceRadix — GERENCIA CÓPIAS HOST/DEVICE
 // ============================================================
-void HostParaDeviceRadix(int *dados_host, int n, int threads_por_bloco)
+void HostParaDeviceRadix(int *dados_host, int num_elementos, int threads_por_bloco)
 {
     cudaError_t err;
 
-    int num_blocos = (n + threads_por_bloco - 1) / threads_por_bloco;
+    int num_blocos = (num_elementos + threads_por_bloco - 1) / threads_por_bloco;
 
     int *dados_device  = nullptr;
     int *buffer_device = nullptr;
 
-    err = cudaMalloc(&dados_device, n * sizeof(int));
+    err = cudaMalloc(&dados_device, num_elementos * sizeof(int));
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar dados_device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar dados_device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         return;
     }
 
-    err = cudaMalloc(&buffer_device, n * sizeof(int));
+    err = cudaMalloc(&buffer_device, num_elementos * sizeof(int));
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar buffer_device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar buffer_device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         return;
     }
 
-    err = cudaMemcpy(dados_device, dados_host, n * sizeof(int), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(dados_device, dados_host, num_elementos * sizeof(int), cudaMemcpyHostToDevice);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro em cudaMemcpy Host->Device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Host->Device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         cudaFree(buffer_device);
         return;
     }
 
-    RadixSortCuda(&dados_device, &buffer_device, n, num_blocos, threads_por_bloco);
+    RadixSortCuda(&dados_device, &buffer_device, num_elementos, num_blocos, threads_por_bloco);
 
     // Após 4 passagens (par), dados_device contém o resultado ordenado
-    err = cudaMemcpy(dados_host, dados_device, n * sizeof(int), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(dados_host, dados_device, num_elementos * sizeof(int), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
-        fprintf(stderr, "Erro em cudaMemcpy Device->Host (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Device->Host (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
 
     cudaFree(dados_device);
     cudaFree(buffer_device);

@@ -30,45 +30,46 @@ using namespace std;
 //               FUNÇÃO PRINCIPAL DO BITONIC SORT
 // ============================================================
 
-void BitonicSortSeq(int *vetor, int n)
+void BitonicSortSeq(int *vetor, int num_elementos)
 {
-    // Calcula a próxima potência de 2 >= n
-    int P = 1;
-    while (P < n) P <<= 1;
+    // Calcula a próxima potência de 2 >= num_elementos
+    int tamanho_padded = 1;
+    while (tamanho_padded < num_elementos) tamanho_padded <<= 1;
 
     // Aloca vetor auxiliar preenchido com INT_MAX (elemento neutro: vai para o fim)
-    int *v = new int[P];
-    for (int i = 0; i < n; i++) v[i] = vetor[i];
-    for (int i = n; i < P; i++) v[i] = INT_MAX;
+    int *vetor_padded = new int[tamanho_padded];
+    for (int i = 0; i < num_elementos; i++) vetor_padded[i] = vetor[i];
+    for (int i = num_elementos; i < tamanho_padded; i++) vetor_padded[i] = INT_MAX;
 
-    // k: tamanho da sequência bitônica atual (2, 4, 8, ..., P)
-    for (int k = 2; k <= P; k <<= 1)
+    // tamanho_seq: tamanho da sequência bitônica atual (2, 4, 8, ..., tamanho_padded)
+    for (int tamanho_seq = 2; tamanho_seq <= tamanho_padded; tamanho_seq <<= 1)
     {
-        // j: distância de comparação dentro do passo (k/2, k/4, ..., 1)
-        for (int j = k >> 1; j > 0; j >>= 1)
+        // j: distância de comparação dentro do passo (tamanho_seq/2, ..., 1)
+        for (int j = tamanho_seq >> 1; j > 0; j >>= 1)
         {
-            for (int i = 0; i < P; i++)
+            for (int i = 0; i < tamanho_padded; i++)
             {
-                int l = i ^ j;  // índice do par de comparação via XOR
-                if (l > i)
+                int indice_par = i ^ j;  // índice do par de comparação via XOR
+                if (indice_par > i)
                 {
-                    // Direção de ordenação: crescente quando o bit k do índice i é 0
-                    bool crescente = (i & k) == 0;
-                    if ((crescente && v[i] > v[l]) || (!crescente && v[i] < v[l]))
+                    // Direção de ordenação: crescente quando o bit tamanho_seq do índice i é 0
+                    bool crescente = (i & tamanho_seq) == 0;
+                    if ((crescente  && vetor_padded[i] > vetor_padded[indice_par]) ||
+                        (!crescente && vetor_padded[i] < vetor_padded[indice_par]))
                     {
-                        int tmp = v[i];
-                        v[i] = v[l];
-                        v[l] = tmp;
+                        int temp = vetor_padded[i];
+                        vetor_padded[i] = vetor_padded[indice_par];
+                        vetor_padded[indice_par] = temp;
                     }
                 }
             }
         }
     }
 
-    // Copia os n primeiros elementos (os INT_MAX ficaram no final) de volta ao vetor original
-    for (int i = 0; i < n; i++) vetor[i] = v[i];
+    // Copia os num_elementos primeiros elementos (os INT_MAX ficaram no final) de volta ao vetor original
+    for (int i = 0; i < num_elementos; i++) vetor[i] = vetor_padded[i];
 
-    delete[] v;
+    delete[] vetor_padded;
 }
 
 // ============================================================

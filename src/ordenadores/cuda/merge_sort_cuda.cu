@@ -11,7 +11,7 @@
     * MERGE_THREADS_POR_BLOCO: número de threads por bloco CUDA quando lançamos um kernel.
         - É uma configuração de desempenho que normalmente depende da GPU.
         - não necessariamente mais threads significa mais desempenho.
-*/ 
+*/
 
 using namespace std;
 
@@ -19,14 +19,14 @@ using namespace std;
 // ============================================================
 //                  Observações gerais
 // ============================================================
-/* 
+/*
     Este arquivo implementa um merge sort paralelo executado na GPU usando CUDA. O fluxo geral é:
         1) Ler vetores de arquivos binários (int)
         2) Copiar os dados para a GPU
         3) Executar várias etapas de "merge" (tamanho da sublista dobrando a cada iteração)
         4) Copiar resultado de volta para o host e regravar o arquivo
         5) Registrar tempos em CSV
-*/ 
+*/
 
 
 
@@ -42,51 +42,51 @@ using namespace std;
  * Parâmetros:
  * - dados: ponteiro para o vetor principal (na memória do device)
  * - buffer_temp:  ponteiro para área temporária (na memória do device)
- * - N: tamanho total do array (número de elementos)
+ * - num_elementos: tamanho total do array (número de elementos)
  * - tamanho_atual: tamanho atual da sublista ordenada. A cada iteração do
  *   MergeSortCuda esta variável dobra (1,2,4,8,...)
  *
  * Cada thread é responsável por mesclar duas sublistas adjacentes
  * de tamanho tamanho_atual (ou menores se estivermos nas bordas).
  */
-__global__ void MergeKernel(int* dados, int* buffer_temp, int N, int tamanho_atual)
+__global__ void MergeKernel(int* dados, int* buffer_temp, int num_elementos, int tamanho_atual)
 {
     // thread_id: índice global da thread (0..num_threads-1)
     long thread_id = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Calcula os índices (em elementos) das duas metades a serem mescladas:
     // Cast explícito para long antes de qualquer multiplicação para evitar overflow de int
-    long esquerda  = (long)thread_id * (long)tamanho_atual * 2L;       // esquerda  = início da primeira metade
-    long meio      = esquerda + (long)tamanho_atual;                    // meio      = início da segunda metade
+    long esquerda  = (long)thread_id * (long)tamanho_atual * 2L;        // esquerda  = início da primeira metade
+    long meio      = esquerda + (long)tamanho_atual;                     // meio      = início da segunda metade
     long direita   = (long)(thread_id + 1L) * (long)tamanho_atual * 2L; // direita   = fim (exclusivo) da segunda metade
 
     // Verificações de segurança para evitar acessar além do array.
-    if (esquerda >= N) return;        // nada a fazer se o início estiver fora
-    if (meio > N)  meio = N;          // ajusta meio se ultrapassar
-    if (direita > N) direita = N;     // ajusta direita se ultrapassar
-    if (esquerda >= direita) return;  // segmento inválido (tamanho 0)
+    if (esquerda >= num_elementos) return;        // nada a fazer se o início estiver fora
+    if (meio > num_elementos)  meio = num_elementos;     // ajusta meio se ultrapassar
+    if (direita > num_elementos) direita = num_elementos; // ajusta direita se ultrapassar
+    if (esquerda >= direita) return;              // segmento inválido (tamanho 0)
 
 
-    long idx_esq = esquerda;     // idx_esq: ponteiro corrente na metade esquerda
-    long idx_dir = meio;         // idx_dir: ponteiro corrente na metade direita
-    long idx_atual = esquerda;   // idx_atual: posição corrente onde iremos colocar no buffer_temp
+    long idx_esq   = esquerda;  // ponteiro corrente na metade esquerda
+    long idx_dir   = meio;      // ponteiro corrente na metade direita
+    long idx_atual = esquerda;  // posição corrente onde iremos colocar no buffer_temp
 
 
-    /* 
-        Merge clássico: 
-        * Compara o elemento mais à frente das duas metades e escreve o menor em buffer_temp. 
+    /*
+        Merge clássico:
+        * Compara o elemento mais à frente das duas metades e escreve o menor em buffer_temp.
         * Continua até que uma das metades acabe ou até preencher todo o intervalo [esquerda,direita).
-    */ 
-    while (idx_esq < meio && idx_dir < direita && idx_atual < direita) 
+    */
+    while (idx_esq < meio && idx_dir < direita && idx_atual < direita)
     {
-        int a = dados[idx_esq];
-        int b = dados[idx_dir];
-        if (a <= b) 
+        int elem_esq = dados[idx_esq];
+        int elem_dir = dados[idx_dir];
+        if (elem_esq <= elem_dir)
         {
-            buffer_temp[idx_atual++] = a;
+            buffer_temp[idx_atual++] = elem_esq;
             idx_esq++;
         } else {
-            buffer_temp[idx_atual++] = b;
+            buffer_temp[idx_atual++] = elem_dir;
             idx_dir++;
         }
     }
@@ -102,18 +102,18 @@ __global__ void MergeKernel(int* dados, int* buffer_temp, int N, int tamanho_atu
     {
         buffer_temp[idx_atual++] = dados[idx_dir++];
     }
-        
+
 
     // Copia o intervalo mesclado de volta para o array original `dados`.
     // Fazemos isso aqui no final do kernel para manter `dados` sempre consistente
     // para iterações futuras (essa escolha evita manter alternância entre dois
     // buffers na CPU; no entanto, dependências de escrita/leitura precisam ser
     // consideradas — aqui cada thread escreve apenas no seu segmento).
-    for (long i = esquerda; i < direita && i < N; ++i)
+    for (long i = esquerda; i < direita && i < num_elementos; ++i)
     {
         dados[i] = buffer_temp[i];
     }
-       
+
 }
 
 // ============================================================
@@ -126,7 +126,7 @@ __global__ void MergeKernel(int* dados, int* buffer_temp, int N, int tamanho_atu
  * Parâmetros:
  * - dados: ponteiro para o vetor no device (GPU)
  * - buffer_temp:  ponteiro para buffer temporário no device
- * - N: tamanho do vetor
+ * - num_elementos: tamanho do vetor
  *
  * Funcionamento:
  * - A ideia do merge sort bottom-up: começamos com sublistas de tamanho 1,
@@ -134,26 +134,26 @@ __global__ void MergeKernel(int* dados, int* buffer_temp, int N, int tamanho_atu
  *   um kernel onde cada thread junta (merge) duas sublistas adjacentes de
  *   tamanho `tamanho`.
  */
-void MergeSortCuda(int* dados, int* buffer_temp, int N)
+void MergeSortCuda(int* dados, int* buffer_temp, int num_elementos)
 {
-    if (N <= 1) 
+    if (num_elementos <= 1)
     {
         return;
     }
 
     // 'tamanho' é o tamanho atual das sublistas ordenadas (1,2,4,8...)
-    for (int tamanho = 1; tamanho < N; tamanho <<= 1) 
+    for (int tamanho = 1; tamanho < num_elementos; tamanho <<= 1)
     {
         // Calcula quantas threads precisamos: cada thread faz o merge de
         // duas sublistas de tamanho `tamanho` => cobre `tamanho*2` elementos.
-        long total_threads = (N + (tamanho * 2L - 1L)) / (tamanho * 2L);
+        long total_threads = (num_elementos + (tamanho * 2L - 1L)) / (tamanho * 2L);
 
         // Converte número de threads em número de blocos considerando
         // MERGE_THREADS_POR_BLOCO por bloco.
         int blocos = (int)((total_threads + MERGE_THREADS_POR_BLOCO - 1) / MERGE_THREADS_POR_BLOCO);
 
         // Lança o kernel com a configuração (blocos, MERGE_THREADS_POR_BLOCO).
-        MergeKernel<<<blocos, MERGE_THREADS_POR_BLOCO>>>(dados, buffer_temp, N, tamanho);
+        MergeKernel<<<blocos, MERGE_THREADS_POR_BLOCO>>>(dados, buffer_temp, num_elementos, tamanho);
 
         // Verifica erro de configuração/launch imediatamente após o lançamento.
         // cudaGetLastError() captura erros síncronos (ex: parâmetros inválidos,
@@ -169,7 +169,7 @@ void MergeSortCuda(int* dados, int* buffer_temp, int N)
         // Qualquer erro de execução do kernel (ex: acesso fora dos limites) é
         // reportado aqui, pois a execução do kernel é assíncrona em relação à CPU.
         cudaError_t syncErr = cudaDeviceSynchronize();
-        if (syncErr != cudaSuccess) 
+        if (syncErr != cudaSuccess)
         {
             fprintf(stderr, "Erro de execução do kernel na iteração tamanho=%d: %s\n", tamanho, cudaGetErrorString(syncErr));
             return;
@@ -188,50 +188,50 @@ void MergeSortCuda(int* dados, int* buffer_temp, int N)
  *
  * Parâmetros:
  * - dados_host: ponteiro para array de inteiros na memória do host
- * - N: número de elementos no array
+ * - num_elementos: número de elementos no array
  */
-void HostParaDeviceMerge(int* dados_host, int N)
+void HostParaDeviceMerge(int* dados_host, int num_elementos)
 {
-    int *dados_device = nullptr;
+    int *dados_device  = nullptr;
     int *buffer_device = nullptr; // ponteiros para device (GPU)
 
     cudaError_t err;
 
-    // Aloca memória para `dados_device` na GPU: espaço para N inteiros
-    err = cudaMalloc(&dados_device, N * sizeof(int));
-    if (err != cudaSuccess) 
+    // Aloca memória para `dados_device` na GPU: espaço para num_elementos inteiros
+    err = cudaMalloc(&dados_device, num_elementos * sizeof(int));
+    if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar dados_device (N=%d): %s\n", N, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar dados_device (N=%d): %s\n", num_elementos, cudaGetErrorString(err));
         return; // aborta se não conseguiu alocar
     }
 
     // Aloca memória para buffer temporário `buffer_device` na GPU
-    err = cudaMalloc(&buffer_device, N * sizeof(int));
-    if (err != cudaSuccess) 
+    err = cudaMalloc(&buffer_device, num_elementos * sizeof(int));
+    if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar buffer_device (N=%d): %s\n", N, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar buffer_device (N=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         return;
     }
 
     // Copia dados do host (CPU) para o device (GPU)
-    err = cudaMemcpy(dados_device, dados_host, N * sizeof(int), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) 
+    err = cudaMemcpy(dados_device, dados_host, num_elementos * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro em cudaMemcpy Host->Device (N=%d): %s\n", N, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Host->Device (N=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         cudaFree(buffer_device);
         return;
     }
 
     // Chama a rotina que executa o merge sort na GPU (controlada por MergeSortCuda)
-    MergeSortCuda(dados_device, buffer_device, N);
+    MergeSortCuda(dados_device, buffer_device, num_elementos);
 
     // Copia o resultado ordenado de volta para o host
-    err = cudaMemcpy(dados_host, dados_device, N * sizeof(int), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(dados_host, dados_device, num_elementos * sizeof(int), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro em cudaMemcpy Device->Host (N=%d): %s\n", N, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Device->Host (N=%d): %s\n", num_elementos, cudaGetErrorString(err));
     }
 
     // Libera memória alocada no device
@@ -273,8 +273,8 @@ void ExecMergeCuda(const char **entradas, int num_entradas, const char *csv_said
         long tamanho = ftell(file) / sizeof(int);
         fseek(file, 0, SEEK_SET);
 
-        int *v = nullptr;
-        err = cudaMallocHost(&v, tamanho * sizeof(int));
+        int *vetor = nullptr;
+        err = cudaMallocHost(&vetor, tamanho * sizeof(int));
         if (err != cudaSuccess)
         {
             fprintf(stderr, "Erro ao alocar pinned memory no host (N=%ld): %s\n", tamanho, cudaGetErrorString(err));
@@ -282,16 +282,16 @@ void ExecMergeCuda(const char **entradas, int num_entradas, const char *csv_said
             continue;
         }
 
-        if (fread(v, sizeof(int), tamanho, file) != (size_t)tamanho)
+        if (fread(vetor, sizeof(int), tamanho, file) != (size_t)tamanho)
         {
             perror("Erro ao ler o arquivo");
             fclose(file);
-            cudaFreeHost(v);
+            cudaFreeHost(vetor);
             continue;
         }
 
         auto inicio = chrono::high_resolution_clock::now();
-        HostParaDeviceMerge(v, tamanho);
+        HostParaDeviceMerge(vetor, tamanho);
         auto fim = chrono::high_resolution_clock::now();
         chrono::duration<double> decorrido = fim - inicio;
         double tempo = decorrido.count();
@@ -299,8 +299,8 @@ void ExecMergeCuda(const char **entradas, int num_entradas, const char *csv_said
         printf("MergeSort CUDA - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
         fprintf(csv, "MergeSort - CUDA,%ld,%f\n", tamanho, tempo);
 
-        GravarEFechar(file, v, tamanho);
-        cudaFreeHost(v);
+        GravarEFechar(file, vetor, tamanho);
+        cudaFreeHost(vetor);
     }
 
     fclose(csv);

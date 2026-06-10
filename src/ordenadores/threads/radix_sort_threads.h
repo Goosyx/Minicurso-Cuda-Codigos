@@ -40,7 +40,7 @@ struct DadosThreadRadix {
     int **contagens;        // contagens[id][256] — contagem local por byte
     int  *prefixo;          // prefixo[256] — posição inicial de cada bucket
     pthread_barrier_t *barreira;
-    int n;
+    int num_elementos;
     int id;
     int num_threads;
 };
@@ -50,72 +50,73 @@ struct DadosThreadRadix {
 // ============================================================
 void* TrabalhadorRadix(void *arg)
 {
-    DadosThreadRadix *d = (DadosThreadRadix *)arg;
+    DadosThreadRadix *dados = (DadosThreadRadix *)arg;
 
-    int id = d->id;
-    int n  = d->n;
-    int nt = d->num_threads;
+    int id             = dados->id;
+    int num_elementos  = dados->num_elementos;
+    int num_threads_total = dados->num_threads;
 
-    int inicio = (n * id) / nt;
-    int fim    = (n * (id + 1)) / nt;
+    int inicio = (num_elementos * id) / num_threads_total;
+    int fim    = (num_elementos * (id + 1)) / num_threads_total;
 
     for (int shift = 0; shift < 32; shift += 8)
     {
         // ── Fase 1: Contagem local ───────────────────────────────────────────
-        for (int b = 0; b < 256; b++) d->contagens[id][b] = 0;
+        for (int bucket = 0; bucket < 256; bucket++) dados->contagens[id][bucket] = 0;
 
-        int *leitura = *(d->p_entrada);
+        int *leitura = *(dados->p_entrada);
         for (int i = inicio; i < fim; i++)
-            d->contagens[id][(leitura[i] >> shift) & 0xFF]++;
+            dados->contagens[id][(leitura[i] >> shift) & 0xFF]++;
 
-        pthread_barrier_wait(d->barreira);
+        pthread_barrier_wait(dados->barreira);
 
         // ── Fase 2: Prefix sum global (Thread 0) ─────────────────────────────
         if (id == 0)
         {
             int total[256] = {0};
-            for (int t = 0; t < nt; t++)
-                for (int b = 0; b < 256; b++)
-                    total[b] += d->contagens[t][b];
+            for (int id_thread = 0; id_thread < num_threads_total; id_thread++)
+                for (int bucket = 0; bucket < 256; bucket++)
+                    total[bucket] += dados->contagens[id_thread][bucket];
 
-            d->prefixo[0] = 0;
-            for (int b = 1; b < 256; b++)
-                d->prefixo[b] = d->prefixo[b - 1] + total[b - 1];
+            dados->prefixo[0] = 0;
+            for (int bucket = 1; bucket < 256; bucket++)
+                dados->prefixo[bucket] = dados->prefixo[bucket - 1] + total[bucket - 1];
         }
 
-        pthread_barrier_wait(d->barreira);
+        pthread_barrier_wait(dados->barreira);
 
         // ── Fase 3: Distribuição ─────────────────────────────────────────────
         // Calcula posição inicial de cada bucket para esta thread:
-        // prefixo[b] + soma das contagens das threads anteriores para b
+        // prefixo[bucket] + soma das contagens das threads anteriores para bucket
         int posicao[256];
-        for (int b = 0; b < 256; b++)
+        for (int bucket = 0; bucket < 256; bucket++)
         {
             int offset = 0;
-            for (int t = 0; t < id; t++) offset += d->contagens[t][b];
-            posicao[b] = d->prefixo[b] + offset + d->contagens[id][b] - 1;
+            for (int id_thread_anterior = 0; id_thread_anterior < id; id_thread_anterior++)
+                offset += dados->contagens[id_thread_anterior][bucket];
+            posicao[bucket] = dados->prefixo[bucket] + offset + dados->contagens[id][bucket] - 1;
         }
 
         // Distribui de trás para frente (estável)
-        int *src = *(d->p_entrada);
-        int *dst = *(d->p_saida);
+        int *src = *(dados->p_entrada);
+        int *dst = *(dados->p_saida);
         for (int i = fim - 1; i >= inicio; i--)
         {
-            int b = (src[i] >> shift) & 0xFF;
-            dst[posicao[b]--] = src[i];
+            int bucket = (src[i] >> shift) & 0xFF;
+            dst[posicao[bucket]--] = src[i];
         }
 
-        pthread_barrier_wait(d->barreira);
+        pthread_barrier_wait(dados->barreira);
 
         // ── Fase 4: Swap de ponteiros (Thread 0) ──────────────────────────────
         if (id == 0)
         {
-            int *temp       = *(d->p_entrada);
-            *(d->p_entrada) = *(d->p_saida);
-            *(d->p_saida)   = temp;
+            int *temp           = *(dados->p_entrada);
+            *(dados->p_entrada) = *(dados->p_saida);
+            *(dados->p_saida)   = temp;
         }
 
-        pthread_barrier_wait(d->barreira);
+        pthread_barrier_wait(dados->barreira);
     }
 
     pthread_exit(0);
@@ -124,16 +125,17 @@ void* TrabalhadorRadix(void *arg)
 // ============================================================
 //                  RADIX SORT COM THREADS
 // ============================================================
-void RadixSortThread(int *vetor, int n, int num_threads)
+void RadixSortThread(int *vetor, int num_elementos, int num_threads)
 {
-    if (n <= 1) return;
+    if (num_elementos <= 1) return;
 
-    int *buffer  = new int[n];
+    int *buffer  = new int[num_elementos];
     int *entrada = vetor;
     int *saida   = buffer;
 
     int **contagens = new int*[num_threads];
-    for (int t = 0; t < num_threads; t++) contagens[t] = new int[256];
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
+        contagens[id_thread] = new int[256];
 
     int *prefixo = new int[256];
 
@@ -143,23 +145,25 @@ void RadixSortThread(int *vetor, int n, int num_threads)
     pthread_t        *threads       = new pthread_t[num_threads];
     DadosThreadRadix *dados_threads = new DadosThreadRadix[num_threads];
 
-    for (int t = 0; t < num_threads; t++)
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
     {
-        dados_threads[t].p_entrada   = &entrada;
-        dados_threads[t].p_saida     = &saida;
-        dados_threads[t].contagens   = contagens;
-        dados_threads[t].prefixo     = prefixo;
-        dados_threads[t].barreira    = &barreira;
-        dados_threads[t].n           = n;
-        dados_threads[t].id          = t;
-        dados_threads[t].num_threads = num_threads;
-        pthread_create(&threads[t], NULL, TrabalhadorRadix, &dados_threads[t]);
+        dados_threads[id_thread].p_entrada    = &entrada;
+        dados_threads[id_thread].p_saida      = &saida;
+        dados_threads[id_thread].contagens    = contagens;
+        dados_threads[id_thread].prefixo      = prefixo;
+        dados_threads[id_thread].barreira     = &barreira;
+        dados_threads[id_thread].num_elementos = num_elementos;
+        dados_threads[id_thread].id           = id_thread;
+        dados_threads[id_thread].num_threads  = num_threads;
+        pthread_create(&threads[id_thread], NULL, TrabalhadorRadix, &dados_threads[id_thread]);
     }
 
-    for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
+        pthread_join(threads[id_thread], NULL);
 
     pthread_barrier_destroy(&barreira);
-    for (int t = 0; t < num_threads; t++) delete[] contagens[t];
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
+        delete[] contagens[id_thread];
     delete[] contagens;
     delete[] prefixo;
     delete[] buffer;

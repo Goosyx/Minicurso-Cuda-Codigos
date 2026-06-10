@@ -17,27 +17,27 @@ void imprimir_vetor(const char **entrada, int num_entradas)
         long tamanho = ftell(file) / sizeof(int);
         fseek(file, 0, SEEK_SET);
 
-        int *v = new int[tamanho];
-        if(fread(v, sizeof(int), tamanho, file) != tamanho)
+        int *vetor = new int[tamanho];
+        if(fread(vetor, sizeof(int), tamanho, file) != tamanho)
         {
             perror("Erro ao ler o arquivo");
             fclose(file);
-            delete[] v;
+            delete[] vetor;
             continue;
         }
         fclose(file);
 
 
         printf("Vetor %s:\n", entrada[i]);
-    
+
         for(long j = 0; j < tamanho; j++)
         {
-            printf("%d ", v[j]);
+            printf("%d ", vetor[j]);
         }
 
         printf("\n\n");
 
-        delete[] v;
+        delete[] vetor;
     }
 }
 

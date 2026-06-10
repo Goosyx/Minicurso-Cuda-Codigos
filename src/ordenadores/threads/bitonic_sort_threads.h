@@ -15,7 +15,7 @@ using namespace std;
     Este arquivo implementa o Bitonic Sort paralelo com threads POSIX.
 
     DECISÃO DE DESIGN — Threads persistentes com barreira:
-        Cada thread executa o mesmo laço (k, j) da versão sequencial, mas
+        Cada thread executa o mesmo laço (tamanho_seq, j) da versão sequencial, mas
         opera apenas na sua faixa de índices [inicio, fim). Uma barreira
         (pthread_barrier_t) sincroniza todas as threads ao final de cada
         passo j, garantindo que nenhuma thread avance antes que todas as
@@ -25,8 +25,8 @@ using namespace std;
         as threads são criadas uma vez e encerradas apenas após o sort completo.
 
     SEGURANÇA DE ESCRITA — Por que não há condição de corrida:
-        Para um dado j, cada elemento forma exatamente um par (i, l=i^j).
-        A troca é executada apenas pela thread dona do índice menor (i < l).
+        Para um dado j, cada elemento forma exatamente um par (i, indice_par=i^j).
+        A troca é executada apenas pela thread dona do índice menor (i < indice_par).
         Como cada elemento pertence a exatamente uma thread e cada troca é
         executada por exatamente uma thread, não há escrita concorrente
         no mesmo elemento dentro de um mesmo passo j.
@@ -35,9 +35,9 @@ using namespace std;
 // Estrutura de dados passada para cada thread
 struct DadosBitonicThread {
     int *vetor;
-    int P;                      // tamanho do vetor padded (potência de 2)
-    int inicio;                 // índice de início da faixa desta thread
-    int fim;                    // índice de fim (exclusivo) da faixa desta thread
+    int tamanho_padded;          // tamanho do vetor padded (potência de 2)
+    int inicio;                  // índice de início da faixa desta thread
+    int fim;                     // índice de fim (exclusivo) da faixa desta thread
     pthread_barrier_t *barreira;
 };
 
@@ -48,24 +48,25 @@ struct DadosBitonicThread {
 void* ThreadBitonicWorker(void *arg)
 {
     DadosBitonicThread *dados = (DadosBitonicThread *)arg;
-    int *v = dados->vetor;
-    int P = dados->P;
+    int *vetor_padded  = dados->vetor;
+    int tamanho_padded = dados->tamanho_padded;
 
-    for (int k = 2; k <= P; k <<= 1)
+    for (int tamanho_seq = 2; tamanho_seq <= tamanho_padded; tamanho_seq <<= 1)
     {
-        for (int j = k >> 1; j > 0; j >>= 1)
+        for (int j = tamanho_seq >> 1; j > 0; j >>= 1)
         {
             for (int i = dados->inicio; i < dados->fim; i++)
             {
-                int l = i ^ j;
-                if (l > i)
+                int indice_par = i ^ j;
+                if (indice_par > i)
                 {
-                    bool crescente = (i & k) == 0;
-                    if ((crescente && v[i] > v[l]) || (!crescente && v[i] < v[l]))
+                    bool crescente = (i & tamanho_seq) == 0;
+                    if ((crescente  && vetor_padded[i] > vetor_padded[indice_par]) ||
+                        (!crescente && vetor_padded[i] < vetor_padded[indice_par]))
                     {
-                        int tmp = v[i];
-                        v[i] = v[l];
-                        v[l] = tmp;
+                        int temp = vetor_padded[i];
+                        vetor_padded[i] = vetor_padded[indice_par];
+                        vetor_padded[indice_par] = temp;
                     }
                 }
             }
@@ -81,14 +82,14 @@ void* ThreadBitonicWorker(void *arg)
 //              FUNÇÃO PRINCIPAL BITONIC SORT COM THREADS
 // ============================================================
 
-void BitonicSortThread(int *vetor, int n, int num_threads)
+void BitonicSortThread(int *vetor, int num_elementos, int num_threads)
 {
-    int P = 1;
-    while (P < n) P <<= 1;
+    int tamanho_padded = 1;
+    while (tamanho_padded < num_elementos) tamanho_padded <<= 1;
 
-    int *v = new int[P];
-    for (int i = 0; i < n; i++) v[i] = vetor[i];
-    for (int i = n; i < P; i++) v[i] = INT_MAX;
+    int *vetor_padded = new int[tamanho_padded];
+    for (int i = 0; i < num_elementos; i++) vetor_padded[i] = vetor[i];
+    for (int i = num_elementos; i < tamanho_padded; i++) vetor_padded[i] = INT_MAX;
 
     pthread_barrier_t barreira;
     pthread_barrier_init(&barreira, NULL, num_threads);
@@ -96,24 +97,24 @@ void BitonicSortThread(int *vetor, int n, int num_threads)
     pthread_t *threads = new pthread_t[num_threads];
     DadosBitonicThread *dados_threads = new DadosBitonicThread[num_threads];
 
-    for (int t = 0; t < num_threads; t++)
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
     {
-        dados_threads[t].vetor = v;
-        dados_threads[t].P = P;
-        dados_threads[t].inicio = (P * t) / num_threads;
-        dados_threads[t].fim = (P * (t + 1)) / num_threads;
-        dados_threads[t].barreira = &barreira;
-        pthread_create(&threads[t], NULL, ThreadBitonicWorker, &dados_threads[t]);
+        dados_threads[id_thread].vetor          = vetor_padded;
+        dados_threads[id_thread].tamanho_padded = tamanho_padded;
+        dados_threads[id_thread].inicio         = (tamanho_padded * id_thread) / num_threads;
+        dados_threads[id_thread].fim            = (tamanho_padded * (id_thread + 1)) / num_threads;
+        dados_threads[id_thread].barreira       = &barreira;
+        pthread_create(&threads[id_thread], NULL, ThreadBitonicWorker, &dados_threads[id_thread]);
     }
 
-    for (int t = 0; t < num_threads; t++)
+    for (int id_thread = 0; id_thread < num_threads; id_thread++)
     {
-        pthread_join(threads[t], NULL);
+        pthread_join(threads[id_thread], NULL);
     }
 
-    for (int i = 0; i < n; i++) vetor[i] = v[i];
+    for (int i = 0; i < num_elementos; i++) vetor[i] = vetor_padded[i];
 
-    delete[] v;
+    delete[] vetor_padded;
     delete[] threads;
     delete[] dados_threads;
     pthread_barrier_destroy(&barreira);
@@ -131,12 +132,12 @@ void ExecBitonicThread(const char **entradas, int num_entradas, int num_threads,
     for (int i = 0; i < num_entradas; i++)
     {
         long tamanho;
-        int *v;
-        FILE *file = LerVetor(entradas[i], &v, &tamanho);
+        int *vetor;
+        FILE *file = LerVetor(entradas[i], &vetor, &tamanho);
         if (!file) continue;
 
         auto inicio = chrono::high_resolution_clock::now();
-        BitonicSortThread(v, tamanho, num_threads);
+        BitonicSortThread(vetor, tamanho, num_threads);
         auto fim = chrono::high_resolution_clock::now();
         chrono::duration<double> decorrido = fim - inicio;
         double tempo = decorrido.count();
@@ -144,8 +145,8 @@ void ExecBitonicThread(const char **entradas, int num_entradas, int num_threads,
         printf("BitonicSort Threads - Tempo para ordenar %s: %f s\n", entradas[i], tempo);
         fprintf(csv, "BitonicSort - Threads,%ld,%f\n", tamanho, tempo);
 
-        GravarEFechar(file, v, tamanho);
-        delete[] v;
+        GravarEFechar(file, vetor, tamanho);
+        delete[] vetor;
     }
 
     fclose(csv);

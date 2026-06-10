@@ -62,24 +62,24 @@ using namespace std;
  *
  * Shared memory: 256 ints (1KB fixo por bloco, independente de blockDim.x).
  */
-__global__ void ContagemKernelOtim(int *dados, int *contagens, int n, int shift)
+__global__ void ContagemKernelOtim(int *dados, int *contagens, int num_elementos, int shift)
 {
     __shared__ int s_hist[256];
 
-    int t   = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + t;
+    int id_thread = threadIdx.x;
+    int idx       = blockIdx.x * blockDim.x + id_thread;
 
     // Zera histograma local em shared memory
-    for (int i = t; i < 256; i += blockDim.x) s_hist[i] = 0;
+    for (int i = id_thread; i < 256; i += blockDim.x) s_hist[i] = 0;
     __syncthreads();
 
     // Cada thread incrementa em shared memory (muito mais rápido que global)
-    if (idx < n)
+    if (idx < num_elementos)
         atomicAdd(&s_hist[(dados[idx] >> shift) & 0xFF], 1);
     __syncthreads();
 
     // Copia histograma local para global memory
-    for (int i = t; i < 256; i += blockDim.x)
+    for (int i = id_thread; i < 256; i += blockDim.x)
         contagens[blockIdx.x * 256 + i] = s_hist[i];
 }
 
@@ -92,16 +92,16 @@ __global__ void ContagemKernelOtim(int *dados, int *contagens, int n, int shift)
  */
 __global__ void PrefixSumKernelOtim(int *contagens, int *totais, int *offsets, int num_blocos)
 {
-    int b = threadIdx.x;
-    if (b >= 256) return;
+    int bucket = threadIdx.x;
+    if (bucket >= 256) return;
 
-    int acc = 0;
+    int acumulador = 0;
     for (int bloco = 0; bloco < num_blocos; bloco++)
     {
-        offsets[bloco * 256 + b] = acc;
-        acc += contagens[bloco * 256 + b];
+        offsets[bloco * 256 + bucket] = acumulador;
+        acumulador += contagens[bloco * 256 + bucket];
     }
-    totais[b] = acc;
+    totais[bucket] = acumulador;
 }
 
 // ============================================================
@@ -112,72 +112,72 @@ __global__ void PrefixSumKernelOtim(int *contagens, int *totais, int *offsets, i
  * usando warp ballot e um prefix sum inter-warp em shared memory.
  *
  * ETAPA 1 — Rank dentro do warp (sem __syncthreads):
- *   Para cada bucket b (0..255):
- *     mask = __ballot_sync(FULL, valor_byte == b)
- *       → bit i do mask = 1 se thread i do warp tem byte == b
+ *   Para cada bucket (0..255):
+ *     mask = __ballot_sync(FULL, valor_byte == bucket)
+ *       → bit i do mask = 1 se thread i do warp tem byte == bucket
  *     warp_rank = __popc(mask & lane_mask_lt)
- *       → quantas threads com lane < meu lane têm o mesmo byte b
+ *       → quantas threads com lane < meu lane têm o mesmo byte bucket
  *
  * ETAPA 2 — Offset inter-warp (1 __syncthreads):
- *   Lane 0 de cada warp escreve em s_hist[warp][b] quantas threads do
- *   seu warp têm byte == b (__popc(mask)).
+ *   Lane 0 de cada warp escreve em s_hist[warp][bucket] quantas threads do
+ *   seu warp têm byte == bucket (__popc(mask)).
  *   Após __syncthreads, cada thread soma s_hist[0..warp-1][valor_byte]
  *   para saber quantos elementos do bucket chegaram antes do seu warp.
  *
- * Posição final = prefixo[b] + offsets[bloco][b] + inter_warp + warp_rank
+ * Posição final = prefixo[bucket] + offsets[bloco][bucket] + inter_warp + warp_rank
  *
  * Shared memory: (num_warps × 256) ints — para P=1024: 32×256×4 = 32KB.
  */
 __global__ void DistribuicaoKernelOtim(int *dados, int *buffer,
                                        int *prefixo, int *offsets,
-                                       int n, int shift)
+                                       int num_elementos, int shift)
 {
     // s_hist[warp][256]: histograma de cada warp por bucket
     extern __shared__ int s_hist[];
 
-    int t     = threadIdx.x;
-    int idx   = blockIdx.x * blockDim.x + t;
-    int lane  = t & 31;                  // posição dentro do warp (0..31)
-    int warp  = t >> 5;                  // índice do warp dentro do bloco
-    int nwarp = blockDim.x >> 5;         // número de warps no bloco
+    int id_thread = threadIdx.x;
+    int idx       = blockIdx.x * blockDim.x + id_thread;
+    int lane      = id_thread & 31;          // posição dentro do warp (0..31)
+    int warp      = id_thread >> 5;          // índice do warp dentro do bloco
+    int num_warps = blockDim.x >> 5;         // número de warps no bloco
 
     // lane_mask_lt: máscara com bits 1 para lanes com índice < lane
     unsigned int lane_mask_lt = (1u << lane) - 1;
 
-    int meu_dado   = (idx < n) ? dados[idx] : 0;
-    int valor_byte = (idx < n) ? ((meu_dado >> shift) & 0xFF) : -1;
+    int meu_dado   = (idx < num_elementos) ? dados[idx] : 0;
+    int valor_byte = (idx < num_elementos) ? ((meu_dado >> shift) & 0xFF) : -1;
 
     // Zera histograma de warps em shared memory
-    for (int i = t; i < nwarp * 256; i += blockDim.x) s_hist[i] = 0;
+    for (int i = id_thread; i < num_warps * 256; i += blockDim.x) s_hist[i] = 0;
     __syncthreads();
 
     // ── Etapa 1: rank dentro do warp via __ballot_sync ────────────────────
     int warp_rank = 0;
 
-    for (int b = 0; b < 256; b++)
+    for (int bucket = 0; bucket < 256; bucket++)
     {
-        // Quais threads do warp têm byte == b?
-        unsigned int mask = __ballot_sync(0xFFFFFFFF, valor_byte == b);
+        // Quais threads do warp têm byte == bucket?
+        unsigned int mask = __ballot_sync(0xFFFFFFFF, valor_byte == bucket);
 
-        if (valor_byte == b)
+        if (valor_byte == bucket)
             warp_rank = __popc(mask & lane_mask_lt);
 
-        // Lane 0 registra a contagem deste warp para o bucket b
+        // Lane 0 registra a contagem deste warp para o bucket
         if (lane == 0)
-            s_hist[warp * 256 + b] = __popc(mask);
+            s_hist[warp * 256 + bucket] = __popc(mask);
     }
     __syncthreads();
 
     // ── Etapa 2: offset inter-warp em shared memory ───────────────────────
     int inter_warp = 0;
-    if (idx < n)
+    if (idx < num_elementos)
     {
-        for (int w = 0; w < warp; w++)
-            inter_warp += s_hist[w * 256 + valor_byte];
+        for (int idx_warp = 0; idx_warp < warp; idx_warp++)
+            inter_warp += s_hist[idx_warp * 256 + valor_byte];
     }
 
     // ── Escrita na posição final ──────────────────────────────────────────
-    if (idx < n)
+    if (idx < num_elementos)
     {
         int pos = prefixo[valor_byte]
                 + offsets[blockIdx.x * 256 + valor_byte]
@@ -191,7 +191,7 @@ __global__ void DistribuicaoKernelOtim(int *dados, int *buffer,
 //       FUNÇÃO DE CONTROLE DO RADIX SORT OTIMIZADO (GPU)
 // ============================================================
 void RadixSortCudaOtim(int **dados_device, int **buffer_device,
-                       int n, int num_blocos, int threads_por_bloco)
+                       int num_elementos, int num_blocos, int threads_por_bloco)
 {
     cudaError_t err;
 
@@ -237,8 +237,8 @@ void RadixSortCudaOtim(int **dados_device, int **buffer_device,
     int prefixo_host[256];
 
     // Shared memory do DistribuicaoKernelOtim: num_warps × 256 ints
-    int num_warps  = threads_por_bloco / 32;
-    size_t shmem_sz = num_warps * 256 * sizeof(int);
+    int num_warps    = threads_por_bloco / 32;
+    size_t shmem_sz  = num_warps * 256 * sizeof(int);
 
     for (int shift = 0; shift < 32; shift += 8)
     {
@@ -246,7 +246,7 @@ void RadixSortCudaOtim(int **dados_device, int **buffer_device,
         cudaMemset(contagens_device, 0, num_blocos * 256 * sizeof(int));
 
         ContagemKernelOtim<<<num_blocos, threads_por_bloco>>>(
-            *dados_device, contagens_device, n, shift);
+            *dados_device, contagens_device, num_elementos, shift);
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -270,8 +270,8 @@ void RadixSortCudaOtim(int **dados_device, int **buffer_device,
         cudaMemcpy(totais_host, totais_device, 256 * sizeof(int), cudaMemcpyDeviceToHost);
 
         prefixo_host[0] = 0;
-        for (int b = 1; b < 256; b++)
-            prefixo_host[b] = prefixo_host[b - 1] + totais_host[b - 1];
+        for (int bucket = 1; bucket < 256; bucket++)
+            prefixo_host[bucket] = prefixo_host[bucket - 1] + totais_host[bucket - 1];
 
         cudaMemcpy(prefixo_device, prefixo_host, 256 * sizeof(int), cudaMemcpyHostToDevice);
 
@@ -279,7 +279,7 @@ void RadixSortCudaOtim(int **dados_device, int **buffer_device,
         DistribuicaoKernelOtim<<<num_blocos, threads_por_bloco, shmem_sz>>>(
             *dados_device, *buffer_device,
             prefixo_device, offsets_device,
-            n, shift);
+            num_elementos, shift);
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -304,44 +304,44 @@ void RadixSortCudaOtim(int **dados_device, int **buffer_device,
 // ============================================================
 //    FUNÇÃO HostParaDeviceRadixOtim — GERENCIA CÓPIAS HOST/DEVICE
 // ============================================================
-void HostParaDeviceRadixOtim(int *dados_host, int n, int threads_por_bloco)
+void HostParaDeviceRadixOtim(int *dados_host, int num_elementos, int threads_por_bloco)
 {
     cudaError_t err;
 
-    int num_blocos = (n + threads_por_bloco - 1) / threads_por_bloco;
+    int num_blocos = (num_elementos + threads_por_bloco - 1) / threads_por_bloco;
 
     int *dados_device  = nullptr;
     int *buffer_device = nullptr;
 
-    err = cudaMalloc(&dados_device, n * sizeof(int));
+    err = cudaMalloc(&dados_device, num_elementos * sizeof(int));
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar dados_device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar dados_device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         return;
     }
 
-    err = cudaMalloc(&buffer_device, n * sizeof(int));
+    err = cudaMalloc(&buffer_device, num_elementos * sizeof(int));
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro ao alocar buffer_device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro ao alocar buffer_device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         return;
     }
 
-    err = cudaMemcpy(dados_device, dados_host, n * sizeof(int), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(dados_device, dados_host, num_elementos * sizeof(int), cudaMemcpyHostToDevice);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "Erro em cudaMemcpy Host->Device (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Host->Device (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
         cudaFree(dados_device);
         cudaFree(buffer_device);
         return;
     }
 
-    RadixSortCudaOtim(&dados_device, &buffer_device, n, num_blocos, threads_por_bloco);
+    RadixSortCudaOtim(&dados_device, &buffer_device, num_elementos, num_blocos, threads_por_bloco);
 
-    err = cudaMemcpy(dados_host, dados_device, n * sizeof(int), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(dados_host, dados_device, num_elementos * sizeof(int), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
-        fprintf(stderr, "Erro em cudaMemcpy Device->Host (n=%d): %s\n", n, cudaGetErrorString(err));
+        fprintf(stderr, "Erro em cudaMemcpy Device->Host (n=%d): %s\n", num_elementos, cudaGetErrorString(err));
 
     cudaFree(dados_device);
     cudaFree(buffer_device);
